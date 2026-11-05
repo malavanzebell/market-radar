@@ -1,0 +1,64 @@
+
+name: Market Radar News Bot
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Choose test or scan'
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - scan
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-radar-news-bot
+  cancel-in-progress: false
+
+jobs:
+  check-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test Telegram connection
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+        run: python market_radar.py --test
+
+      - name: Read fresh news once
+        if: github.event_name == 'schedule' || inputs.mode == 'scan'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          MIN_SCORE: '7'
+          MAX_AGE_HOURS: '24'
+          MAX_ALERTS_PER_CYCLE: '6'
+        run: python market_radar.py --once
+
+      - name: Save news history
+        if: github.event_name == 'schedule' || inputs.mode == 'scan'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f market_radar.sqlite3
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: record processed headlines [skip ci]'
+            git push
+          fi
