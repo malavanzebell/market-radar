@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v2.0: relevance-filtered news + truthful quote-style price ticker.
+"""Market Radar v2.1: strict financial-news screening + verified price ticker.
 
 Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
@@ -100,7 +100,7 @@ PATTERNS = {
     ],
     "macro": [
         (r"\b(?:fomc|federal reserve|the fed|fed chair|powell|rate decision|interest rates?|rate cuts?|rate hikes?|monetary policy|quantitative easing|quantitative tightening)\b", 5),
-        (r"\b(?:cpi|consumer price index|core inflation|inflation data|pce|personal consumption expenditures|ppi|producer price index|nonfarm payrolls?|nfp|unemployment rate|jobs report|employment situation)\b", 5),
+        (r"\b(?:cpi|consumer price index|core inflation|inflation data|pce|personal consumption expenditures|ppi|producer price index|nonfarm payrolls?|nfp|unemployment rate|jobless rate|jobless claims|employment report|jobs report|employment situation)\b", 5),
         (r"\b(?:treasury yields?|bond yields?|u\.s\. dollar|dollar index|dxy|jolts|job openings|gdp|recession|stagflation|debt ceiling|tariffs?|trade war)\b", 3),
     ],
     "geopolitics": [
@@ -123,7 +123,7 @@ PATTERNS = {
 }
 # Persian-language publisher headlines need the same relevance screening as
 # English RSS titles. Keep triggers specific to meaningful market developments.
-PATTERNS["gold"].append((r"(?:طلا|اونس|انس جهانی|شمش|ذخایر طلای|قیمت جهانی طلا)", 6))
+PATTERNS["gold"].append((r"(?:(?<![\w])طلا(?!یی)|اونس|انس جهانی|شمش|ذخایر طلای|قیمت جهانی طلا)", 6))
 PATTERNS["macro"].extend([
     (r"(?:فدرال رزرو|نرخ بهره|بانک مرکزی آمریکا|سیاست پولی|اشتغال آمریکا|گزارش اشتغال|تورم آمریکا|شاخص قیمت مصرف کننده|شاخص قیمت تولیدکننده|افزایش نرخ بهره|کاهش نرخ بهره)", 5),
     (r"(?:تعرفه تجاری|رکود اقتصادی|بازده اوراق|انتخابات میان.?دوره.?ای آمریکا)", 3),
@@ -386,6 +386,70 @@ GEO_ANCHOR = re.compile(
 )
 
 
+# v2.1: Never mistake saffron or an idiom for investable gold.
+# Matches apply to the headline ONLY, irrespective of RSS summary or source.
+AGRICULTURAL_OR_METAPHORICAL_GOLD = re.compile(
+    r"(?:طلای[\s\u200c]*(?:سرخ|سبز|سفید|سیاه)|"
+    r"طلایی[\s\u200c]*(?:ترین|برای|که|شد|است|از|در|به|و|؛|:)|"
+    r"فرصت[\s\u200c]*طلایی|کلید[\s\u200c]*طلایی|نسل[\s\u200c]*طلایی|"
+    r"(?:زعفران|پنبه|پسته|گندم|زرشک)[\s\S]{0,100}(?:کشت|برداشت|مزرعه|کشاورز|جوانه|قیمت|صادرات)|"
+    r"(?:جوانه زد|کشتزار|زمین[\s\u200c]*های? کشاورزی|برداشت زعفران|کشت زعفران)|"
+    r"\b(?:saffron|red gold|white gold crops?|golden opportunity|golden chance|"
+    r"golden age|golden goal|gold medal|agricultural harvest)\b)",
+    re.I,
+)
+
+# Labour-market data from official US releases are needed. Recruitment,
+# careers and employment-advice headlines are not those releases.
+CAREER_OR_RECRUITMENT_NEWS = re.compile(
+    r"(?:فرصت[\s\u200c]*(?:شغلی|استخدام|طلایی)|"
+    r"(?:ورود|بازگشت)[\s\u200c]*به[\s\u200c]*بازار کار|"
+    r"(?:آگهی|آزمون|مصاحبه)[\s\u200c]*استخدام|"
+    r"(?:استخدام|کارآموزی|کاریابی|رزومه[\s\u200c]*نویسی|"
+    r"مهارت[\s\u200c]*آموزی|مشاغل خانگی)|"
+    r"\b(?:job vacancies|job openings at [a-z]|career advice|"
+    r"recruitment drive|hiring event|how to get a job|career opportunity)\b)",
+    re.I,
+)
+
+# The existence of a war keyword in a background court/social story is not
+# an immediate market-relevant military or geopolitical development.
+NON_MARKET_CIVIC_STORY = re.compile(
+    r"(?:کشیش|کلیسا|کاتولیک|محکوم[\s\u200c]*به[\s\u200c]*زندان|"
+    r"سال زندان|یادبود جنگ|فعال مدنی|فعال حقوق بشر|مخالفت با جنگ|"
+    r"جشنواره|نمایشگاه هنری|مراسم عروسی|"
+    r"\b(?:priest|clergyman|catholic church|sentenced to prison|"
+    r"anti-war activist|war memorial)\b)",
+    re.I,
+)
+
+# A financial subject alone is not sufficient. Look for a concrete price
+# move, policy decision, official release, market action or financial outcome.
+# The separate geopolitical path requires its own event action + location.
+CONCRETE_FINANCIAL_DEVELOPMENT = re.compile(
+    r"(?:قیمت|نرخ|بهای|ارزش|شاخص|بازده|بازار|معاملات|تراکنش|"
+    r"افزایش|کاهش|افت|رشد|ریزش|جهش|سقوط|صعود|نزول|"
+    r"خرید|فروش|سرمایه[\s\u200c]*گذاری|ذخایر|عرضه|تقاضا|"
+    r"تصویب|اعلام|انتشار|منتشر|تصمیم|تغییر|تثبیت|رسید|"
+    r"رکورد|شکست|کاهش یافت|افزایش یافت|"
+    r"گزارش اشتغال|نرخ بیکاری|تورم|بهره|سیاست پولی|"
+    r"تحریم|تعرفه|صندوق|ورود سرمایه|خروج سرمایه|"
+    r"محدودیت معاملاتی|نوسان|"
+    r"\b(?:price|prices|rose|rises|rising|fall|falls|fell|"
+    r"surge|surges|jump|jumps|drop|drops|plunge|plunges|"
+    r"steady|holds|held|trading|trades|traded|market|markets|"
+    r"rate|rates|inflation|payroll|jobs report|unemployment|"
+    r"yield|yields|tariff|sanction|export|import|production|"
+    r"supply|demand|earnings|revenue|profit|loss|"
+    r"fund|funds|etf|approval|approved|rejects|rejected|"
+    r"announces|announced|decision|decides|cuts|cut|hikes|hiked|"
+    r"index|stocks|futures|bond|bonds|record|high|low|"
+    r"inflows|outflows|regulation|regulator|blockchain|"
+    r"settlement|exchange|shortage|slump|selloff|rally)\b)",
+    re.I,
+)
+
+
 def news_is_report_worthy(a: Article, rating: Assessment) -> tuple[bool, str]:
     """Reject off-topic/fiction/speculative headlines before publishing.
 
@@ -396,6 +460,12 @@ def news_is_report_worthy(a: Article, rating: Assessment) -> tuple[bool, str]:
     title = strip_source_suffix(clean_text(a.title)).replace("\u200c", " ")
     if len(title) < 12:
         return False, "too_short"
+    if AGRICULTURAL_OR_METAPHORICAL_GOLD.search(title):
+        return False, "agriculture_or_gold_metaphor"
+    if CAREER_OR_RECRUITMENT_NEWS.search(title):
+        return False, "career_advice_not_macro_data"
+    if NON_MARKET_CIVIC_STORY.search(title):
+        return False, "non_market_social_or_civic_news"
     if NON_MARKET_TITLE.search(title):
         return False, "entertainment_or_local"
     if QUESTION_OR_SPECULATION.search(title) or OPINION_TITLE.search(title):
@@ -418,6 +488,8 @@ def news_is_report_worthy(a: Article, rating: Assessment) -> tuple[bool, str]:
     # not include all peripheral bank-office or regulatory notices.
     official_release = bool(a.official and a.topic in {"fed", "cpi", "jobs", "ppi"}
                             and MARKET_POLICY_ACTION.search(title))
+    if market_headline and not CONCRETE_FINANCIAL_DEVELOPMENT.search(title):
+        market_headline = False  # Avoid a news item triggered only by a vague noun.
     if not (market_headline or geopolitical_headline or official_release):
         return False, "no_concrete_market_event"
     # Headlines like "Fed chair speaks at a conference" do not announce a
