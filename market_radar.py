@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v2.1: strict financial-news screening + verified price ticker.
+"""Market Radar v2.3: filtered financial news + NerkhAra price API every 30 min.
 
 Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
@@ -12,10 +12,12 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 import hashlib
 import html
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -1166,70 +1168,85 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
 
 
 
-# Price board: public no-key Iranian market data. Provider data updates at its
-# own rate (~30 minutes), independently of the 5-minute GitHub check. Prices
-# are NOT financial quotes or guaranteed real-time executions.
-PRICE_FEED_URL = "https://raw.githubusercontent.com/iran-market/iran-market.github.io/main/data/popular.json"
-PRICE_SYMBOLS = (
-    ("USD_IRR_FREE", "💵 دلار آزاد"),
-    ("GOLD_18K_IRR", "🥇 طلای ۱۸ عیار (هر گرم)"),
-    ("COIN_EMAMI_IRR", "🪙 سکه امامی"),
-    ("EUR_IRR_FREE", "💶 یورو آزاد"),
-    ("USDT_IRR", "💠 تتر"),
-)
+# Rate source: https://nerkhara.com/en/api/ (documented public JSON API).
+# The provider rebuilds approximately every 10 minutes. Its free-usage terms
+# require credit with a working link and an observation time in each PRICE POST.
+# Source: https://nerkhara.com/api/v1/index.json ('terms').
+# Do not replace a free-dollar mid/reference rate with Tehran-futures bid/ask.
+NERKHARA_PRICE_URL = "https://nerkhara.com/api/v1/latest.json"
+NERKHARA_ATTRIBUTION = "NerkhAra | https://nerkhara.com"
+NERKHARA_SYMBOLS = {
+    "usd": ("USD_IRR_FREE", "IRT"),
+    "gold-18k": ("GOLD_18K_IRR", "IRT"),
+    "coin-emami": ("COIN_EMAMI_IRR", "IRT"),
+    "usdt": ("USDT_IRR", "IRT"),
+    "eur": ("EUR_IRR_FREE", "IRT"),
+    "gold-mesghal": ("GOLD_MESGHAL_IRR", "IRT"),
+    "xau": ("XAUUSD_SPOT", "USD"),
+}
 CORE_PRICE_SYMBOLS = {"USD_IRR_FREE", "GOLD_18K_IRR", "COIN_EMAMI_IRR"}
 
 
-def _price_record_time(record: dict) -> datetime | None:
-    raw = record.get("timestamp")
+def _nerkhara_timestamp(raw: object) -> datetime | None:
+    # API explicitly names this field updated_utc. Its documented examples omit Z.
+    # Naive times are therefore interpreted as UTC, never as the machine timezone.
     if not isinstance(raw, str) or not raw:
         return None
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt).astimezone(timezone.utc)
-    except ValueError:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
         return None
 
 
-def normalize_price_feed(payload: bytes, *, now: datetime | None = None) -> dict[str, dict]:
-    """Strictly validate price, currency, quote timestamp, and symbol."""
+def normalize_nerkhara_feed(payload: bytes, *, now: datetime | None = None) -> dict[str, dict]:
+    """Parse NerkhAra rate JSON; preserve source quote time, unit, staleness.
+
+    Do not invent values for unavailable symbols or accept mismatched units.
+    Missing core quotes cause update_price_board to skip the entire bulletin.
+    """
     now = now or datetime.now(timezone.utc)
     raw = json.loads(payload)
-    records = raw.get("data")
-    if not isinstance(records, list):
-        raise ValueError("Price feed is missing data[]")
-    selected = {}
-    allowed = {symbol for symbol, _ in PRICE_SYMBOLS}
-    for record in records:
-        if not isinstance(record, dict) or record.get("symbol") not in allowed:
+    if not isinstance(raw, dict) or raw.get("api") != "nerkhara/v1":
+        raise ValueError("Unexpected NerkhAra API payload/version")
+    entries = raw.get("items")
+    if not isinstance(entries, list):
+        raise ValueError("NerkhAra API has no items list")
+    selected: dict[str, dict] = {}
+    for record in entries:
+        if not isinstance(record, dict):
             continue
-        if record.get("currency") != "IRT":
-            continue  # No silent rial/toman conversion from an unexpected feed.
-        value = record.get("price")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        spec = NERKHARA_SYMBOLS.get(record.get("id"))
+        if spec is None:
             continue
-        value = float(value)
-        if not (0 < value < 1_000_000_000_000):
+        symbol, unit = spec
+        if record.get("unit") != unit:
             continue
-        quote_time = _price_record_time(record)
+        price = record.get("price")
+        if type(price) not in (int, float) or not math.isfinite(price):
+            continue
+        if unit == "USD":
+            if not 100 < price < 30_000:
+                continue
+        elif not 1 <= price <= 1_000_000_000_000:
+            continue
+        quote_time = _nerkhara_timestamp(record.get("updated_utc"))
         if quote_time is None or quote_time > now + timedelta(minutes=10):
             continue
-        # Reject numbers far too old even for a "last available" quote.
-        if now - quote_time > timedelta(days=14):
+        if now - quote_time > timedelta(days=3):
             continue
-        selected[record["symbol"]] = {"value": value, "time": quote_time, "stale": bool(record.get("stale"))}
-    if not CORE_PRICE_SYMBOLS.issubset(selected):
-        raise ValueError("Price feed does not have all three required rates (USD, 18K gold, Emami coin)")
+        selected[symbol] = {
+            "value": float(price), "time": quote_time,
+            "stale": bool(record.get("stale", False)),
+            "provider": "nerkhara", "unit": unit,
+        }
     return selected
 
 
 def _price_to_fa(value: float) -> str:
     return to_fa_digits(f"{value:,.0f}").replace(",", "٬")
-
-
-# This public, keyless XAU/USD endpoint is independent of the Iranian market feed.
-# It reports a reference spot price rather than an executable two-way quotation.
-GOLD_SPOT_URL = "https://api.gold-api.com/price/XAU"
 
 
 def _validated_utc_time(raw: object, now: datetime, *, max_days: int = 7) -> datetime | None:
@@ -1245,24 +1262,6 @@ def _validated_utc_time(raw: object, now: datetime, *, max_days: int = 7) -> dat
     if not (now - timedelta(days=max_days) <= dt <= now + timedelta(minutes=10)):
         return None
     return dt
-
-
-def normalize_gold_spot(payload: bytes, *, now: datetime | None = None) -> dict[str, object]:
-    """Validate public gold-api.com XAU spot USD/oz, including its own quote timestamp."""
-    now = now or datetime.now(timezone.utc)
-    raw = json.loads(payload)
-    if not isinstance(raw, dict) or raw.get("symbol") != "XAU":
-        raise ValueError("Gold feed did not return XAU")
-    # Gold-API documents currency=USD; older responses may omit currency.
-    if raw.get("currency", "USD") != "USD":
-        raise ValueError("XAU quote is not in USD")
-    price = raw.get("price")
-    if isinstance(price, bool) or not isinstance(price, (int, float)) or not 200 < float(price) < 20000:
-        raise ValueError("Invalid gold spot quote")
-    dt = _validated_utc_time(raw.get("updatedAt"), now, max_days=7)
-    if dt is None:
-        raise ValueError("Gold spot time missing or invalid")
-    return {"value": float(price), "time": dt, "stale": False}
 
 
 def normalize_extra_quotes(payload: bytes, *, now: datetime | None = None) -> dict[str, dict]:
@@ -1353,6 +1352,7 @@ def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | N
     labels = (
         ("USD_IRR_FREE", "💵 دلار آزاد"),
         ("MELTED_GOLD_CASH", "💰 آبشده نقدی"),
+        ("GOLD_MESGHAL_IRR", "💰 مظنه آبشده (مثقال)"),
         ("GOLD_18K_IRR", "✨ طلای ۱۸ عیار (گرمی)"),
         ("COIN_EMAMI_IRR", "🪙 سکه امامی"),
         ("USDT_IRR", "💠 تتر [USDT]"),
@@ -1379,11 +1379,16 @@ def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | N
 
     # Display time of the OLDEST quote in the board so it never looks fresher than it is.
     if used_times:
-        oldest = min(used_times).astimezone(TEHRAN)
+        oldest_utc = min(used_times)
+        oldest = oldest_utc.astimezone(TEHRAN)
         jalali_time = _jalali_date(oldest.date()) + " " + oldest.strftime("%H:%M")
         lines.extend(["", "🕒 قدیمی‌ترین نرخ: " + to_fa_digits(jalali_time) + " تهران"])
     if stale_count:
-        lines.append("⏳ بعضی نرخ‌ها قدیمی‌اند؛ آخرین قیمت ثبت‌شده نمایش داده شده.")
+        lines.append("⏳ بعضی نرخ‌ها قدیمی‌اند؛ آخرین نرخ ثبت‌شده نمایش داده شده.")
+    # Required by the NerkhAra free JSON API terms. This is displayed only
+    # for PRICE bulletins; the separate news posts keep their existing layout.
+    if any(q.get("provider") == "nerkhara" for q in prices.values() if isinstance(q, dict)):
+        lines.extend(["", "منبع قیمت‌ها: " + NERKHARA_ATTRIBUTION])
     footer = channel_link(channel)
     if footer:
         lines.extend(["", "🔗 " + footer])
@@ -1407,86 +1412,75 @@ def _telegram_price_request(method: str, token: str, values: dict[str, str]) -> 
 
 def update_price_board(db: sqlite3.Connection, token: str, channel: str, *, preview: bool = False,
                        now: datetime | None = None) -> str:
-    """One consolidated message per Tehran day, edited only on material updates.
+    """Send a new NerkhAra-backed Telegram price bulletin once per 30-min slot.
 
-    Provider errors leave prior post intact; the news workflow remains independent.
+    News remains on the separate five-minute scan. A 30-minute slot is
+    processed once, and failed downloads/sends are retried on the next scan.
     """
     if os.getenv("PRICES_ENABLED", "1").strip().lower() in {"0", "false", "no"}:
         return "disabled"
     now = now or datetime.now(timezone.utc)
+    interval = int(os.getenv("PRICE_POST_INTERVAL_MINUTES", "30"))
+    if interval not in (20, 30, 60):
+        interval = 30
+    tehran_now = now.astimezone(TEHRAN)
+    slot_minute = (tehran_now.minute // interval) * interval
+    slot = tehran_now.strftime("%Y-%m-%d %H:") + f"{slot_minute:02d}"
+    # If already posted, avoid fetching and spamming sites unnecessarily.
+    if not preview and get_meta(db, "price_last_post_slot") == slot:
+        LOGGER.info("Prices: 30-minute slot %s already posted", slot)
+        return "slot_already_posted"
+
+    prices: dict[str, dict] = {}
     try:
-        # Query the public data file once. No paid API key needed.
-        data = http_get(PRICE_FEED_URL, timeout=14)
-        prices = normalize_price_feed(data, now=now)
-    except (ValueError, json.JSONDecodeError, URLError, OSError, TimeoutError, HTTPError) as exc:
-        LOGGER.warning("Price feed unavailable/invalid; leaving prior board untouched: %s", exc)
-        return "unavailable"
+        prices = normalize_nerkhara_feed(http_get(NERKHARA_PRICE_URL, timeout=12), now=now)
+        LOGGER.info("NerkhAra JSON returned %d timestamped quote records", len(prices))
+    except (ValueError, TypeError, KeyError, URLError, OSError, TimeoutError, HTTPError) as exc:
+        LOGGER.warning("NerkhAra rate API unavailable: %s", type(exc).__name__)
 
-    # Independent global spot quotation. A failure must not interrupt Iranian rates.
-    if os.getenv("XAUUSD_ENABLED", "1").strip() not in {"0", "false", "no"}:
-        try:
-            spot = normalize_gold_spot(http_get(GOLD_SPOT_URL, timeout=8), now=now)
-            prices["XAUUSD_SPOT"] = spot
-        except (ValueError, json.JSONDecodeError, URLError, OSError, TimeoutError, HTTPError) as exc:
-            LOGGER.warning("XAUUSD spot unavailable, preserving Iranian quotes: %s", exc)
+    # Reject incomplete or old core prices. Do not silently fall back to an
+    # unrelated page scrape or a stale GitHub file, and never make up a rate.
+    if not CORE_PRICE_SYMBOLS.issubset(prices):
+        LOGGER.warning("Price board skipped: NerkhAra USD / 18K gold / Emami not all available")
+        return "incomplete"
+    oldest_core = min(prices[s]["time"] for s in CORE_PRICE_SYMBOLS)
+    if (now - oldest_core) > timedelta(hours=72):
+        LOGGER.warning("Price board skipped: one NerkhAra core quote older than 72h")
+        return "stale_core"
 
-    # Optionally attach licensed quote fields, if the owner supplies a verified URL.
     extra_url = os.getenv("MARKET_EXTRA_QUOTES_URL", "").strip()
-    if extra_url:
-        if not extra_url.startswith("https://"):
-            LOGGER.warning("MARKET_EXTRA_QUOTES_URL must use HTTPS")
-        else:
-            try:
-                extras = normalize_extra_quotes(http_get(extra_url, timeout=10), now=now)
-                prices.update(extras)
-            except (ValueError, json.JSONDecodeError, URLError, OSError, TimeoutError, HTTPError) as exc:
-                LOGGER.warning("Optional Tehran futures/melted feed unavailable: %s", exc)
+    if extra_url.startswith("https://"):
+        try:
+            prices.update(normalize_extra_quotes(http_get(extra_url, timeout=8), now=now))
+        except (ValueError, json.JSONDecodeError, TypeError, URLError, OSError, TimeoutError, HTTPError) as exc:
+            LOGGER.info("Optional Tehran futures feed unavailable: %s", type(exc).__name__)
+    elif extra_url:
+        LOGGER.warning("Optional quotes URL must start https://")
 
     max_age = max(30, int(os.getenv("PRICE_FRESH_MINUTES", "90")))
     body = price_board_text(prices, channel, now=now, max_fresh_minutes=max_age)
+    # Never confuse the publication time with the time of the rate quotation.
+    body = body.replace("📊 نرخ بازار تهران | دلار، طلا و سکه",
+        "📊 نرخ بازار تهران | دلار، طلا و سکه\n🗓 نوبت گزارش: " +
+        to_fa_digits(tehran_now.strftime("%H:%M")) + " به وقت تهران", 1)
     if preview:
-        print("\n===== PRICE BOARD PREVIEW =====\n" + body + "\n")
+        print("\n===== 30-MIN PRICE SNAPSHOT PREVIEW =====\n" + body + "\n")
         return "preview"
-    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    day = now.astimezone(TEHRAN).strftime("%Y-%m-%d")
-    prev_day = get_meta(db, "price_board_day")
-    prev_id = get_meta(db, "price_board_message_id")
-    prev_hash = get_meta(db, "price_board_hash")
-    if prev_day == day and prev_id and prev_hash == digest:
-        LOGGER.info("Price board unchanged; Telegram edit skipped")
-        return "unchanged"
 
-    base = {"chat_id": channel, "text": body, "link_preview_options": json.dumps({"is_disabled": True})}
-    if prev_day == day and prev_id:
-        try:
-            _telegram_price_request("editMessageText", token, {**base, "message_id": str(int(prev_id))})
-            put_meta(db, "price_board_hash", digest)
-            LOGGER.info("Price board message %s edited with latest verified quotes", prev_id)
-            return "edited"
-        except RuntimeError as exc:
-            msg = str(exc).lower()
-            if "message is not modified" in msg:
-                put_meta(db, "price_board_hash", digest)
-                return "unchanged"
-            # When a message has been manually deleted, replace it once.
-            if not ("message to edit not found" in msg or "message can't be edited" in msg
-                    or "message identifier is not specified" in msg):
-                LOGGER.error("Price board edit failed; not creating duplicate post: %s", exc)
-                return "edit_failed"
-
+    base = {"chat_id": channel, "text": body,
+            "link_preview_options": json.dumps({"is_disabled": True})}
     try:
         reply = _telegram_price_request("sendMessage", token, base)
         msg_id = reply.get("result", {}).get("message_id")
-        if not isinstance(msg_id, int) or msg_id < 1:
-            LOGGER.error("Telegram returned no message_id; price post was sent but cannot be tracked")
-            return "sent_untracked"
-        put_meta(db, "price_board_message_id", str(msg_id))
-        put_meta(db, "price_board_day", day)
-        put_meta(db, "price_board_hash", digest)
-        LOGGER.info("Price board posted in one message, id=%s", msg_id)
+        # Persist slot before next run. The workflow commits database after step.
+        put_meta(db, "price_last_post_slot", slot)
+        put_meta(db, "price_last_post_utc", now.isoformat())
+        if isinstance(msg_id, int):
+            put_meta(db, "price_last_message_id", str(msg_id))
+        LOGGER.info("New 30-minute price snapshot posted: slot=%s id=%s", slot, msg_id)
         return "posted"
     except (RuntimeError, URLError, OSError, TimeoutError) as exc:
-        LOGGER.error("Price board send failed: %s", exc)
+        LOGGER.error("Price snapshot send failed, retrying later: %s", exc)
         return "send_failed"
 
 
@@ -1496,7 +1490,7 @@ def main() -> None:
     mode.add_argument("--test", action="store_true", help="Send one Telegram connection test")
     mode.add_argument("--once", action="store_true", help="Run a single check, then exit")
     mode.add_argument("--preview", action="store_true", help="Check feeds without posting or saving anything")
-    mode.add_argument("--prices-once", action="store_true", help="Only create/edit the consolidated price message")
+    mode.add_argument("--prices-once", action="store_true", help="Send a consolidated price snapshot when 30-minute slot is new")
     mode.add_argument("--prices-preview", action="store_true", help="Preview public prices without sending Telegram posts")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
