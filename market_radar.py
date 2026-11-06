@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v1.5: wider geopolitics + multi-source audit + Tehran news.
+"""Market Radar v1.6: clean Telegram posts and Tehran-only economic event times.
 
 Python 3.10+ standard library only. No paid API and no trading signals.
 """
@@ -474,16 +474,50 @@ def translate_title(title: str) -> str:
         return source
 
 
+# Importance is not the same as confidence. Do not label every selected
+# headline "important" merely because it passed the relevance filter.
+# Only specific exceptional developments receive a visible prefix.
+MAJOR_MACRO_RELEASE = re.compile(
+    r"(?:\b(?:fomc|federal funds rate|interest rate decision|rate decision|"
+    r"employment situation|nonfarm payrolls?|consumer price index|cpi)\b|"
+    r"نرخ بهره|تصمیم فدرال رزرو|گزارش اشتغال آمریکا|شاخص قیمت مصرف.کننده)",
+    re.I,
+)
+EXCEPTIONAL_GEOPOLITICAL_EVENT = re.compile(
+    r"(?:\b(?:war (?:begins|starts)|declares? war|declaration of war|"
+    r"strait of hormuz (?:has been )?(?:closed|blocked)|"
+    r"hormuz (?:closure|blockade)|full.scale invasion)\b|"
+    r"آغاز جنگ|شروع جنگ|اعلام جنگ|بسته شدن تنگه هرمز|"
+    r"مسدود شدن تنگه هرمز|حمله سراسری)",
+    re.I,
+)
+
+
+def exceptional_prefix(a: Article, rating: Assessment) -> str:
+    """Sparse labels for exceptional news, never for every ordinary report.
+
+    For exceptional geopolitical claims without independent verification the
+    prefix explicitly says that the item is a report, not a confirmed fact.
+    """
+    if EXCEPTIONAL_GEOPOLITICAL_EVENT.search(a.title):
+        return "⚠️ گزارش اولیه"
+    if a.official and a.topic in {"fed", "cpi", "jobs"} and MAJOR_MACRO_RELEASE.search(a.title):
+        return "🚨 خبر مهم"
+    return ""
+
+
 def format_alert(a: Article, rating: Assessment, channel: str = "", *, translate: bool = False) -> str:
-    """Minimal post: headline, Tehran time, user's channel link only."""
-    rank = "🚨 گزارش اولیه" if MILITARY_ALERT.search(a.title) else ("🔴 اهمیت بالا" if rating.score >= 10 else "🟠 خبر مهم")
-    topic = "🥇 طلا و بازارهای مالی" if rating.gold_relevant else TOPIC_LABEL[rating.category]
+    """Ordinary story: one short headline and the owner's channel link.
+
+    News article publication time, arbitrary category labels, and source names
+    are intentionally omitted. Only separate scheduled-economic notices
+    display an event date/time converted to Asia/Tehran.
+    """
     headline = compact_headline(a.title)
     if translate:
         headline = translate_title(headline)
-    body = (f"{rank} | {topic}\n\n"
-            f"{headline}\n\n"
-            f"🕒 {tehran_time(a.published)}")
+    prefix = exceptional_prefix(a, rating)
+    body = (prefix + "\n\n" if prefix else "") + headline
     footer = channel_link(channel)
     if footer:
         body += "\n\n🔗 " + footer
@@ -638,13 +672,17 @@ def calendar_notices(db: sqlite3.Connection, token: str, channel: str, *, previe
             continue
         # Send one 24-hour notice and one closer reminder. If the event
         # enters the last hour for the first time, send only the close notice.
-        stage = "نزدیک انتشار" if remaining <= 60 else "رویداد پیش‌رو"
         slot = "hour" if remaining <= 60 else "day"
         key = f"event:{kind}:{release_time.isoformat()}:{slot}"
         if get_meta(db, key):
             continue
-        body = (f"📅 {stage} | {EVENT_LABELS.get(kind, kind)}\n\n"
-                f"🕒 {tehran_time(release_time)}")
+        # Scheduled economic releases are the *only* regular messages that
+        # contain a date and time, always converted from the event timezone.
+        local = release_time.astimezone(TEHRAN)
+        day = to_fa_digits(local.strftime("%Y/%m/%d"))
+        hour = to_fa_digits(local.strftime("%H:%M"))
+        body = (f"📊 {EVENT_LABELS.get(kind, kind)}\n\n"
+                f"📅 {day} | 🕒 ساعت {hour} به وقت تهران")
         footer = channel_link(channel)
         if footer:
             body += "\n\n🔗 " + footer
@@ -698,7 +736,9 @@ def initial_digest(db: sqlite3.Connection, articles: list[Article], token: str,
     ), reverse=True)
     sent = 0
     for key, a, assessment in shortlist[:3]:
-        message = "🗞 مرور اخبار مهم اخیر (ارسال اولیه، نه خبر فوری)\n\n" + format_alert(a, assessment, channel, translate=True)
+        # A one-off digest needs a clear 'recent' label so older headlines are
+        # never mistaken for breaking reports. This never repeats every cycle.
+        message = "🗞 مرور خبرهای اخیر\n\n" + format_alert(a, assessment, channel, translate=True)
         try:
             telegram_send(message, token, channel)
         except (RuntimeError, TimeoutError, URLError, OSError) as exc:
@@ -825,7 +865,7 @@ def main() -> None:
     if not args.preview and (not token or not channel):
         p.error("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL to .env")
     if args.test:
-        telegram_send("✅ اتصال Market Radar برقرار است.\n🕒 " + tehran_time(datetime.now(timezone.utc)) + ("\n\n🔗 " + channel_link(channel) if channel_link(channel) else ""), token, channel)
+        telegram_send("✅ اتصال Market Radar برقرار است." + ("\n\n🔗 " + channel_link(channel) if channel_link(channel) else ""), token, channel)
         print("Telegram test message sent.")
         return
     interval = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "180")))
