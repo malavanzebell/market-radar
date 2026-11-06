@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Market Radar: free, source-linked RSS alerts to a Telegram channel.
+"""Market Radar v1.5: wider geopolitics + multi-source audit + Tehran news.
 
 Python 3.10+ standard library only. No paid API and no trading signals.
 """
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 import hashlib
 import html
@@ -20,17 +23,19 @@ import sqlite3
 import time
 from typing import Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, quote, quote_plus, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 BASE_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("market_radar")
-TEHRAN = timezone(timedelta(hours=3, minutes=30))
+TEHRAN = ZoneInfo("Asia/Tehran")
+NEW_YORK = ZoneInfo("America/New_York")
+DIGITS_FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 USER_AGENT = "MarketRadarPersonal/1.0 (+RSS reader; personal Telegram notifications)"
 
-# All RSS URLs were traced to the publishers' official feed-directory pages.
-# Financial news RSS feeds include headlines, not necessarily the entire article.
+# Mix of directly published RSS feeds and labelled Google News search feeds.
+# Not all hosts grant automated access from GitHub runners. Failure is logged.
 FEEDS = [
     {"name": "Federal Reserve | Monetary Policy", "url": "https://www.federalreserve.gov/feeds/press_monetary.xml", "topic": "fed", "official": True},
     {"name": "Federal Reserve | Speeches", "url": "https://www.federalreserve.gov/feeds/speeches.xml", "topic": "fed_speech", "official": True},
@@ -46,6 +51,43 @@ FEEDS = [
     {"name": "CNBC | World News", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "topic": "global", "official": False},
     {"name": "CNBC | Economy", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "topic": "global", "official": False},
     {"name": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "topic": "crypto", "official": False},
+    # Verified public publisher feeds, added for market-relevant breaking news.
+    {"name": "BBC | World", "url": "https://feeds.bbci.co.uk/news/world/rss.xml", "topic": "global", "official": False},
+    {"name": "BBC | Middle East", "url": "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml", "topic": "global", "official": False},
+    {"name": "BBC | Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml", "topic": "global", "official": False},
+    {"name": "Al Jazeera | Latest", "url": "https://www.aljazeera.com/xml/rss/all.xml", "topic": "global", "official": False},
+    {"name": "CNBC | Politics", "url": "https://www.cnbc.com/id/10000113/device/rss/rss.html", "topic": "global", "official": False},
+    {"name": "CNBC | Finance", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "topic": "global", "official": False},
+    {"name": "CNBC | Asia", "url": "https://www.cnbc.com/id/19832390/device/rss/rss.html", "topic": "global", "official": False},
+    {"name": "NPR | World", "url": "https://feeds.npr.org/1004/rss.xml", "topic": "global", "official": False},
+    {"name": "DW | English", "url": "https://rss.dw.com/rdf/rss-en-all", "topic": "global", "official": False},
+    {"name": "The Guardian | World", "url": "https://www.theguardian.com/world/rss", "topic": "global", "official": False},
+    # Google News search feed is an aggregator, not an official Reuters/AP RSS feed.
+    {"name": "Google News | Reuters geopolitical search", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:reuters.com (Iran OR Israel OR Hormuz OR Gulf OR sanctions OR war OR oil) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "Google News | AP geopolitical search", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:apnews.com (Iran OR Israel OR Hormuz OR Gulf OR strikes OR sanctions) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    # Israel: breaking/liveblog feeds are useful for rapid updates, but are not
+    # proof by themselves that a contested claim is accurate.
+    {"name": "Times of Israel | Breaking live blog", "url": "https://www.timesofisrael.com/feed/?post_type=liveblog_entry", "topic": "global", "official": False},
+    {"name": "Times of Israel | Main", "url": "https://www.timesofisrael.com/feed/", "topic": "global", "official": False},
+    {"name": "Jerusalem Post | Breaking", "url": "https://www.jpost.com/rss/rssfeedsheadlines.aspx", "topic": "global", "official": False},
+    {"name": "Jerusalem Post | Iran", "url": "https://www.jpost.com/rss/rssfeedsiran", "topic": "global", "official": False},
+    {"name": "Jerusalem Post | Middle East", "url": "https://www.jpost.com/rss/rssfeedsmiddleeastnews.aspx", "topic": "global", "official": False},
+    # Iran: retain original Persian headlines without machine translation.
+    {"name": "IRNA | English", "url": "https://en.irna.ir/rss", "topic": "global", "official": False},
+    {"name": "Mehr | English", "url": "https://en.mehrnews.com/rss", "topic": "global", "official": False},
+    {"name": "Mehr | Persian", "url": "https://www.mehrnews.com/rss", "topic": "global", "official": False},
+    {"name": "ISNA | Persian", "url": "https://www.isna.ir/rss", "topic": "global", "official": False},
+    {"name": "Tasnim | Persian", "url": "https://www.tasnimnews.com/fa/rss/feed/0/8/0/" + quote("مهمترین-اخبار-تسنیم"), "topic": "global", "official": False},
+    {"name": "YJC | Persian", "url": "https://www.yjc.ir/fa/rss/allnews", "topic": "global", "official": False},
+    # Google News is an index of publisher reports and may update later than
+    # the publisher itself. These are supplementary, not direct official feeds.
+    {"name": "Reuters via Google News | Iran and Israel", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:reuters.com (Iran OR Israel OR Pentagon OR Hormuz OR missile OR airstrike) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "AP via Google News | Iran and Israel", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:apnews.com (Iran OR Israel OR Gulf OR strikes OR missiles OR ceasefire) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "Haaretz via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:haaretz.com (Iran OR Israel OR military OR war OR ceasefire) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "Ynet via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:ynetnews.com (Iran OR Israel OR Gulf OR military) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "Iranian news via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('(site:irna.ir OR site:isna.ir OR site:mehrnews.com OR site:tasnimnews.com) (ایران OR اسرائیل OR آمریکا OR جنگ OR حمله OR تحریم) when:1d') + "&hl=fa&gl=IR&ceid=IR:fa", "topic": "global", "official": False},
+    {"name": "CENTCOM official releases via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:centcom.mil (Iran OR Israel OR Gulf OR shipping OR military) when:2d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "IDF official statements via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:idf.il (Iran OR Israel OR missile OR strike) when:2d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
 ]
 
 # These are screening terms, not a market-direction model. A title hit gets
@@ -61,7 +103,8 @@ PATTERNS = {
         (r"\b(?:treasury yields?|bond yields?|u\.s\. dollar|dollar index|dxy|jolts|job openings|gdp|recession|stagflation|debt ceiling|tariffs?|trade war)\b", 3),
     ],
     "geopolitics": [
-        (r"\b(?:airstrikes?|missile attacks?|military strikes?|invasion|war|ceasefire|sanctions?|nuclear deal|strait of hormuz|shipping disruption|iran|israel|russia|ukraine|middle east)\b", 3),
+        (r"\b(?:airstrikes?|missile attacks?|military strikes?|invasion|war|ceasefire|sanctions?|nuclear deal|strait of hormuz|shipping disruption|armed conflict|military operation|troop deployment|troops? deploy(?:ed|ment)?|naval blockade|drone attacks?|explosions?|missile launch|pentagon|red sea attack|tanker seized|escalat(?:e|es|ed|ion|ing)|military action|retaliation|ultimatum|peace agreement|military threat|warship)\b", 5),
+        (r"\b(?:iran|israel|russia|ukraine|middle east|persian gulf|gulf states?|hormuz|iraq|yemen|lebanon|nuclear talks?|nuclear negotiations)\b", 2),
     ],
     "crypto": [
         (r"\b(?:bitcoin|btc|ethereum|ether|eth|crypto|cryptocurrency|stablecoin|digital assets?|spot etf|exchange.traded fund|sec approval|sec rejects?|tokenization|coinbase|binance)\b", 4),
@@ -70,12 +113,36 @@ PATTERNS = {
         (r"\b(?:oil prices?|crude oil|brent|wti|opec\+?|petroleum|oil inventories?|oil production|barrels? per day|energy supply|gas supplies?|oil exports?|oil imports?)\b", 4),
     ],
     "stocks": [
-        (r"\b(?:s&p 500|nasdaq|dow jones|wall street|equities|stock market|stock futures|earnings|nvidia|apple|microsoft|amazon|tesla|market selloff|market rally|stock index)\b", 3),
+        (r"\b(?:s&p 500|nasdaq|dow jones|wall street|equities|stock market|stock futures|earnings|nvidia|apple|microsoft|amazon|tesla|market selloff|market rally|stock index|market crash|stock plunge)\b", 4),
     ],
     "forex": [
-        (r"\b(?:forex|currency markets?|foreign exchange|eur/usd|usd/jpy|gbp/usd|yen|euro|bank of japan|bank of england|ecb|european central bank|dollar)\b", 3),
+        (r"\b(?:forex|currency markets?|foreign exchange|eur/usd|usd/jpy|gbp/usd|yen|euro|bank of japan|bank of england|ecb|european central bank|dollar index|dxy|currency crisis|dollar)\b", 4),
+        (r"(?:فارکس|بازار ارز|دلار|یورو|ین ژاپن|بانک مرکزی اروپا|شاخص دلار)", 3),
     ],
 }
+# Persian-language publisher headlines need the same relevance screening as
+# English RSS titles. Keep triggers specific to meaningful market developments.
+PATTERNS["gold"].append((r"(?:طلا|اونس|انس جهانی|شمش|ذخایر طلای|قیمت جهانی طلا)", 6))
+PATTERNS["macro"].extend([
+    (r"(?:فدرال رزرو|نرخ بهره|بانک مرکزی آمریکا|سیاست پولی|اشتغال آمریکا|گزارش اشتغال|تورم آمریکا|شاخص قیمت مصرف کننده|شاخص قیمت تولیدکننده|افزایش نرخ بهره|کاهش نرخ بهره)", 5),
+    (r"(?:تعرفه تجاری|رکود اقتصادی|بازده اوراق|انتخابات میان.?دوره.?ای آمریکا)", 3),
+])
+PATTERNS["geopolitics"].extend([
+    (r"(?:حمله|حملات|حملۀ|بمباران|موشک|پهپاد|پدافند|شلیک|انفجار|آتش.?بس|جنگ|درگیری|تلافی|ترور|رزمایش|حمله نظامی|هشدار نظامی|تحریم|درخواست تخلیه|محاصره دریایی|ناو جنگی|اعلام وضعیت اضطراری|آماده.?باش|تنگه هرمز|بستن تنگه|بسته شدن مسیر کشتیرانی|دستور حمله|تشدید تنش)", 5),
+    (r"(?:ایران|اسرائیل|آمریکا|خلیج فارس|خاورمیانه|تنگه هرمز|لبنان|عراق|یمن|سوریه|دریای سرخ)", 2),
+    (r"(?:مذاکرات هسته.?ای|توافق هسته.?ای|دیدار دیپلماتیک|مذاکرات ایران و آمریکا|گفت.?وگوهای صلح)", 5),
+])
+PATTERNS["oil"].append((r"(?:نفت|برنت|اوپک|پالایشگاه|صادرات نفت|تولید نفت|ذخایر نفت|نفت خام)", 4))
+PATTERNS["crypto"].append((r"(?:بیت.?کوین|اتریوم|رمزارز|ارز دیجیتال|استیبل کوین)", 4))
+PATTERNS["stocks"].append((r"(?:بورس آمریکا|وال استریت|نزدک|داوجونز|شاخص اس.?اند.?پی|بازار سهام آمریکا)", 4))
+
+# Headlines posing hypothetical war scenarios should not masquerade as events.
+OPINION_TITLE = re.compile(r"(?:\b(?:opinion|editorial|analysis|explainer)\s*[:|]\s*|آیا جنگ (?:می.?شود|خواهد شد)|احتمال وقوع جنگ چقدر)", re.I)
+# Even trusted media may relay unverified early reports. Never label as confirmed.
+MILITARY_ALERT = re.compile(
+    r"(?:\b(?:airstrikes?|bombardment|missiles? (?:launched|fired)|launches? (?:an? )?(?:strike|attack)|war (?:begins|starts)|explosions?|attacks? (?:iran|israel|us)|invasion)\b|"
+    r"(?:شروع جنگ|آغاز جنگ|حمله(?:های)? (?:نظامی|موشکی)|حمله (?:به|علیه)|حملات به|بمباران|انفجار|شلیک موشک|اصابت موشک|ترور|هدف قرار گرفت))", re.I
+)
 
 BASE_SCORE = {"fed": 7, "fed_speech": 1, "cpi": 7, "jobs": 7, "ppi": 7, "ecb": 3, "oil": 1, "sec": 1, "global": 0, "crypto": 0}
 TOPIC_CATEGORY = {"fed": "macro", "fed_speech": "macro", "cpi": "macro", "jobs": "macro", "ppi": "macro", "ecb": "forex", "oil": "oil", "sec": "stocks", "crypto": "crypto"}
@@ -214,6 +281,11 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(db_path)
     db.execute("CREATE TABLE IF NOT EXISTS seen (fingerprint TEXT PRIMARY KEY, first_seen TEXT NOT NULL, status TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS sent_titles (title_hash TEXT PRIMARY KEY)")
+    # Private implementation detail: auditing source provenance without showing
+    # source links or publisher names in Telegram messages.
+    db.execute("CREATE TABLE IF NOT EXISTS observations (fingerprint TEXT PRIMARY KEY, title TEXT, source TEXT, published_utc TEXT, first_observed_utc TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS published_stories (fingerprint TEXT PRIMARY KEY, title TEXT, source TEXT, url TEXT, published_utc TEXT, sent_utc TEXT)")
     db.commit()
     return db
 
@@ -229,11 +301,93 @@ def put_meta(db: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def is_seen(db: sqlite3.Connection, key: str) -> bool:
-    return db.execute("SELECT 1 FROM seen WHERE fingerprint=?", (key,)).fetchone() is not None
+    row = db.execute("SELECT status FROM seen WHERE fingerprint=?", (key,)).fetchone()
+    # Re-evaluate older low-score headlines after a threshold change. Keep
+    # sent and baseline/stale items excluded. No old history is erased.
+    return bool(row and row[0] != "filtered")
 
 
 def mark_seen(db: sqlite3.Connection, key: str, status: str) -> None:
-    db.execute("INSERT OR IGNORE INTO seen VALUES(?,?,?)", (key, datetime.now(timezone.utc).isoformat(), status))
+    db.execute("INSERT OR REPLACE INTO seen VALUES(?,?,?)", (key, datetime.now(timezone.utc).isoformat(), status))
+    db.commit()
+
+
+SOURCE_SUFFIX = re.compile(
+    r"\s+[-|]\s+(?:Reuters|AP News|Associated Press|BBC(?: News)?|CNBC|The Guardian|"
+    r"CoinDesk|Times of Israel|The Times of Israel|The Jerusalem Post|Jerusalem Post|JPost|"
+    r"Ynet(?:news)?|Haaretz|IRNA|ISNA|Tasnim(?: News)?|Mehr(?: News Agency)?|"
+    r"خبرگزاری (?:ایرنا|ایسنا|مهر|تسنیم|فارس|باشگاه خبرنگاران جوان)|ایرنا|ایسنا|تسنیم|مهر)\s*$", re.I
+)
+
+
+def strip_source_suffix(title: str) -> str:
+    return SOURCE_SUFFIX.sub("", title).strip()
+
+
+def title_key(a: Article) -> str:
+    # Avoid repeating the same headline across BBC, CNBC and aggregation feeds.
+    title = strip_source_suffix(a.title.lower())
+    title = re.sub(r"[^\w\s]", " ", title, flags=re.UNICODE)
+    title = re.sub(r"\s+", " ", title).strip()
+    return hashlib.sha256(title.encode("utf-8")).hexdigest()
+
+
+def already_sent_title(db: sqlite3.Connection, a: Article) -> bool:
+    return db.execute("SELECT 1 FROM sent_titles WHERE title_hash=?", (title_key(a),)).fetchone() is not None
+
+
+def _normalized_title(title: str) -> str:
+    # Remove trailing media attribution, compare within the same language only.
+    t = clean_text(title).casefold()
+    t = strip_source_suffix(t)
+    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def similar_headlines(left: str, right: str) -> bool:
+    """Catch close rewrites while preserving numerical updates and other events."""
+    query, other = _normalized_title(left), _normalized_title(right)
+    if len(query) < 25 or len(other) < 25:
+        return query == other
+    if bool(re.search(r"[\u0600-\u06ff]", query)) != bool(re.search(r"[\u0600-\u06ff]", other)):
+        return False
+    if numeric_tokens(query) != numeric_tokens(other):
+        return False
+    qt, ot = set(query.split()), set(other.split())
+    if min(len(qt), len(ot)) < 5:
+        return query == other
+    jaccard = len(qt & ot) / max(1, len(qt | ot))
+    return jaccard >= 0.82 or SequenceMatcher(None, query, other).ratio() >= 0.91
+
+
+def near_duplicate(db: sqlite3.Connection, a: Article, *, lookback_h: int = 6) -> bool:
+    """Conservative within-language similarity, never a multilingual fact checker."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=lookback_h)).isoformat()
+    recent = db.execute("SELECT title FROM published_stories WHERE sent_utc >= ? ORDER BY sent_utc DESC LIMIT 150", (since,)).fetchall()
+    return any(similar_headlines(a.title, row[0]) for row in recent)
+
+
+def record_observations(db: sqlite3.Connection, articles: list[Article], now: datetime) -> None:
+    rows = []
+    for a in articles:
+        if not a.published or not (now - timedelta(hours=36) <= a.published <= now + timedelta(hours=2)):
+            continue
+        rating = assess(a)
+        if (rating.category != "geopolitics" and not any(re.search(pattern, a.title, re.IGNORECASE) for pattern, _ in PATTERNS["geopolitics"])) or rating.score < 4:
+            continue
+        rows.append((fingerprint(a), a.title[:500], a.source, a.published.isoformat(), now.isoformat()))
+    if rows:
+        db.executemany("INSERT OR IGNORE INTO observations VALUES (?,?,?,?,?)", rows)
+        db.execute("DELETE FROM observations WHERE first_observed_utc < ?", ((now - timedelta(days=14)).isoformat(),))
+        db.commit()
+    LOGGER.info("Geopolitics source observations processed: %d", len(rows))
+
+
+def mark_sent(db: sqlite3.Connection, key: str, a: Article) -> None:
+    mark_seen(db, key, "sent")
+    db.execute("INSERT OR IGNORE INTO sent_titles(title_hash) VALUES (?)", (title_key(a),))
+    db.execute("INSERT OR IGNORE INTO published_stories VALUES (?,?,?,?,?,?)", (key, a.title, a.source, a.url, a.published.isoformat() if a.published else "", datetime.now(timezone.utc).isoformat()))
+    db.execute("DELETE FROM published_stories WHERE sent_utc < ?", ((datetime.now(timezone.utc) - timedelta(days=21)).isoformat(),))
     db.commit()
 
 
@@ -252,44 +406,329 @@ def telegram_send(text: str, token: str, channel: str) -> None:
         raise RuntimeError(f"Telegram rejected message: {str(body)[:300]}")
 
 
-def format_alert(a: Article, rating: Assessment) -> str:
-    published = a.published.astimezone(TEHRAN).strftime("%Y-%m-%d %H:%M") if a.published else "نامشخص"
-    source_kind = "مرجع رسمی" if a.official else "رسانه خبری"
-    # Original title stays intact to prevent silent numerical translation errors.
-    attention = "🥇 اولویت طلا" if rating.gold_relevant else TOPIC_LABEL[rating.category]
-    title = a.title[:300]
-    return (f"{'🔴' if rating.score >= 10 else '🟠'} {rating.tier}\n"
-            f"{attention}\n\n"
-            f"عنوان اصلی: {title}\n\n"
-            f"حوزه: {TOPIC_LABEL[rating.category]}\n"
-            f"چرایی اهمیت: {TOPIC_IMPACT[rating.category]}\n\n"
-            f"منبع: {a.source} ({source_kind})\n"
-            f"زمان انتشار: {published}، تهران\n"
-            f"لینک خبر: {a.url}\n\n"
-            "یادآوری: این پیام خبر و طبقه‌بندی موضوعی است، نه سیگنال خرید یا فروش.")
+def channel_link(channel: str) -> str:
+    """Only the user's public Telegram channel URL is included in posts."""
+    channel = channel.strip()
+    if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", channel):
+        return "https://t.me/" + channel[1:]
+    LOGGER.warning("Public channel username not recognized; footer will be omitted")
+    return ""
+
+
+def to_fa_digits(text: str) -> str:
+    return text.translate(DIGITS_FA)
+
+
+def tehran_time(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return "زمان انتشار اعلام نشده"
+    local = dt.astimezone(TEHRAN)
+    return to_fa_digits(local.strftime("%Y/%m/%d ، %H:%M")) + " به وقت تهران"
+
+
+def compact_headline(raw: str, max_len: int = 175) -> str:
+    """Do not copy hidden links or site tags from syndication headlines."""
+    title = clean_text(raw)
+    title = re.sub(r"(?:https?://|www\.)\S+", "", title, flags=re.I)
+    title = strip_source_suffix(title)
+    title = re.sub(r"\s+", " ", title).strip(" -|\n")
+    if len(title) <= max_len:
+        return title
+    cut = title[:max_len].rsplit(" ", 1)[0].rstrip(" ,.;:")
+    return (cut or title[:max_len]) + "…"
+
+
+def numeric_tokens(text: str) -> list[str]:
+    normalized = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+    return sorted(re.findall(r"\d+(?:[.,]\d+)?", normalized))
+
+
+def translate_title(title: str) -> str:
+    """Optional no-key translation with conservative fallback to source title.
+
+    5,000 characters/day anonymous quota, 500-byte input limit. It is not used
+    for editorial verification and never changes trading figures unnoticed.
+    """
+    if os.getenv("TRANSLATE_TO_FA", "1").strip().lower() in {"0", "false", "no"}:
+        return title
+    if re.search(r"[\u0600-\u06ff]", title):
+        return title
+    source = compact_headline(title, 170)
+    if not source or len(source.encode("utf-8")) > 500:
+        return title
+    try:
+        url = "https://api.mymemory.translated.net/get?" + urlencode({"q": source, "langpair": "en|fa"})
+        payload = json.loads(http_get(url, timeout=5))
+        translated = clean_text(payload.get("responseData", {}).get("translatedText", ""))
+        translated = compact_headline(translated, 175)
+        if (not translated or not re.search(r"[\u0600-\u06ff]", translated)
+                or numeric_tokens(source) != numeric_tokens(translated)
+                or (re.search(r"\b(?:not|never|denies|denied|denial|no evidence|false report|without)\b", source, re.I)
+                    and not re.search(r"(?:نیست|نیستند|نبود|نشد|نکرد|نمی|تکذیب|رد کرد|عدم |بدون|شایعه|نادرست)", translated))
+                or translated.upper().startswith("MYMEMORY WARNING")
+                or "QUERY LENGTH LIMIT" in translated.upper()):
+            return source
+        return translated
+    except (ValueError, KeyError, TypeError, URLError, OSError, TimeoutError) as exc:
+        LOGGER.info("Translation unavailable; original headline retained (%s)", type(exc).__name__)
+        return source
+
+
+def format_alert(a: Article, rating: Assessment, channel: str = "", *, translate: bool = False) -> str:
+    """Minimal post: headline, Tehran time, user's channel link only."""
+    rank = "🚨 گزارش اولیه" if MILITARY_ALERT.search(a.title) else ("🔴 اهمیت بالا" if rating.score >= 10 else "🟠 خبر مهم")
+    topic = "🥇 طلا و بازارهای مالی" if rating.gold_relevant else TOPIC_LABEL[rating.category]
+    headline = compact_headline(a.title)
+    if translate:
+        headline = translate_title(headline)
+    body = (f"{rank} | {topic}\n\n"
+            f"{headline}\n\n"
+            f"🕒 {tehran_time(a.published)}")
+    footer = channel_link(channel)
+    if footer:
+        body += "\n\n🔗 " + footer
+    return body
 
 
 def fetch_articles() -> tuple[list[Article], int]:
-    result = []
+    # Parallel fetching reduces slow-feeds blocking timely scans.
+    def read_one(feed: dict) -> list[Article]:
+        return parse_feed(http_get(feed["url"], timeout=12), feed)
+
+    result: list[Article] = []
     good = 0
-    for feed in FEEDS:
-        try:
-            data = http_get(feed["url"])
-            found = parse_feed(data, feed)
-            good += 1
-            result.extend(found)
-            LOGGER.info("%s: %d items", feed["name"], len(found))
-        except (ET.ParseError, ValueError, OSError, URLError, TimeoutError) as exc:
-            LOGGER.warning("Feed unavailable: %s [%s]", feed["name"], exc)
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = {executor.submit(read_one, f): f for f in FEEDS}
+        for future in as_completed(futures):
+            feed = futures[future]
+            try:
+                found = future.result()
+                good += 1
+                result.extend(found)
+                LOGGER.info("%s: %d items", feed["name"], len(found))
+            except (ET.ParseError, ValueError, OSError, URLError, TimeoutError) as exc:
+                LOGGER.warning("Feed unavailable: %s [%s]", feed["name"], exc)
     return result, good
+
+
+
+# Verified release times. Dynamic BLS iCalendar is preferred over these fallback dates.
+# The FOMC item is tied to the Fed's officially published Dec 2026 calendar.
+BLS_ICS = "https://www.bls.gov/schedule/news_release/bls.ics"
+FALLBACK_RELEASES = [
+    ("NFP", "2026-11-06", "08:30"),
+    ("CPI", "2026-11-10", "08:30"),
+    ("PPI", "2026-11-13", "08:30"),
+    ("NFP", "2026-12-04", "08:30"),
+    ("CPI", "2026-12-10", "08:30"),
+    ("PPI", "2026-12-15", "08:30"),
+    ("NFP", "2027-01-08", "08:30"),
+]
+FOMC_RELEASES = [
+    ("FOMC", "2026-12-09", "14:00"),
+    ("نشست خبری فدرال رزرو", "2026-12-09", "14:30"),
+]
+EVENT_LABELS = {"NFP": "گزارش اشتغال آمریکا (NFP)", "CPI": "تورم آمریکا (CPI)",
+                "PPI": "تورم تولیدکننده آمریکا (PPI)", "FOMC": "تصمیم نرخ بهره فدرال رزرو (FOMC)",
+                "نشست خبری فدرال رزرو": "نشست خبری رئیس فدرال رزرو"}
+
+
+def event_dt(date_str: str, hour_str: str) -> datetime:
+    return datetime.strptime(date_str + " " + hour_str, "%Y-%m-%d %H:%M").replace(tzinfo=NEW_YORK).astimezone(timezone.utc)
+
+
+def calendar_kind(summary: str) -> str:
+    title = summary.lower()
+    if "employment situation" in title or "nonfarm payroll" in title:
+        return "NFP"
+    if "consumer price index" in title or re.search(r"\bcpi\b", title):
+        return "CPI"
+    if "producer price index" in title or re.search(r"\bppi\b", title):
+        return "PPI"
+    return ""
+
+
+def parse_bls_ics(payload: bytes) -> list[tuple[str, datetime]]:
+    """Read official BLS iCalendar dates. Untimed events are skipped."""
+    lines = []
+    for ln in payload.decode("utf-8-sig", "replace").splitlines():
+        if ln.startswith((" ", "\t")) and lines:
+            lines[-1] += ln[1:]
+        else:
+            lines.append(ln)
+    events = []
+    entry = None
+    for ln in lines:
+        if ln == "BEGIN:VEVENT":
+            entry = {}
+        elif ln == "END:VEVENT" and entry is not None:
+            summary = entry.get("SUMMARY", "")
+            event_type = calendar_kind(summary)
+            dt_entry = entry.get("DTSTART")
+            if event_type and dt_entry:
+                raw_key, raw_val = dt_entry
+                try:
+                    if re.fullmatch(r"\d{8}T\d{6}Z", raw_val):
+                        d = datetime.strptime(raw_val, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+                    elif re.fullmatch(r"\d{8}T\d{6}", raw_val):
+                        tzid = re.search(r"TZID=([^;:]+)", raw_key)
+                        tz = ZoneInfo(tzid.group(1)) if tzid else NEW_YORK
+                        d = datetime.strptime(raw_val, "%Y%m%dT%H%M%S").replace(tzinfo=tz).astimezone(timezone.utc)
+                    elif re.fullmatch(r"\d{8}T\d{4}", raw_val):
+                        d = datetime.strptime(raw_val, "%Y%m%dT%H%M").replace(tzinfo=NEW_YORK).astimezone(timezone.utc)
+                    else:
+                        d = None  # Never guess a missing clock time.
+                    if d:
+                        events.append((event_type, d))
+                except (ValueError, KeyError):
+                    pass
+            entry = None
+        elif entry is not None and ":" in ln:
+            k, v = ln.split(":", 1)
+            entry[k.split(";", 1)[0]] = (k, v) if k.startswith("DTSTART") else v.replace("\\,", ",")
+    return events
+
+
+def load_calendar(db: sqlite3.Connection, now: datetime) -> list[tuple[str, datetime]]:
+    """Use cached official calendar for 12h, fallback to confirmed release dates."""
+    last = get_meta(db, "calendar_refreshed_at")
+    cached = get_meta(db, "calendar_feed_entries")
+    if last and cached:
+        try:
+            if now - datetime.fromisoformat(last) < timedelta(hours=12):
+                entries = [(name, datetime.fromisoformat(iso)) for name, iso in json.loads(cached)]
+            else:
+                entries = []
+        except (ValueError, TypeError, json.JSONDecodeError):
+            entries = []
+    else:
+        entries = []
+    if not entries:
+        entries = []
+        try:
+            entries = parse_bls_ics(http_get(BLS_ICS, timeout=8))
+            if entries:
+                LOGGER.info("Official BLS calendar: %d timed events", len(entries))
+        except (URLError, OSError, TimeoutError, ET.ParseError) as exc:
+            LOGGER.warning("Official BLS calendar unavailable: %s", type(exc).__name__)
+        # Only use date-specific fallback after failed or incomplete ICS input.
+        mapped = {(n, d) for n, d in entries}
+        for name, date_str, hour in FALLBACK_RELEASES:
+            d = event_dt(date_str, hour)
+            # Do not add an obsolete fallback if the official feed has moved
+            # the release to another date in the same reference month.
+            if not any(n == name and x.astimezone(NEW_YORK).strftime("%Y-%m") == date_str[:7]
+                       for n, x in mapped):
+                entries.append((name, d))
+        put_meta(db, "calendar_feed_entries", json.dumps([(n, d.isoformat()) for n, d in entries]))
+        put_meta(db, "calendar_refreshed_at", now.isoformat())
+    entries.extend((n, event_dt(date_str, hour)) for n, date_str, hour in FOMC_RELEASES)
+    return sorted(set(entries), key=lambda p: p[1])
+
+
+def calendar_notices(db: sqlite3.Connection, token: str, channel: str, *, preview: bool = False) -> int:
+    if os.getenv("CALENDAR_ENABLED", "1").lower() in {"0", "false", "no"}:
+        return 0
+    now = datetime.now(timezone.utc)
+    events = load_calendar(db, now)
+    count = 0
+    for kind, release_time in events:
+        remaining = (release_time - now).total_seconds() / 60
+        if remaining <= 0 or remaining > 1440:
+            continue
+        # Send one 24-hour notice and one closer reminder. If the event
+        # enters the last hour for the first time, send only the close notice.
+        stage = "نزدیک انتشار" if remaining <= 60 else "رویداد پیش‌رو"
+        slot = "hour" if remaining <= 60 else "day"
+        key = f"event:{kind}:{release_time.isoformat()}:{slot}"
+        if get_meta(db, key):
+            continue
+        body = (f"📅 {stage} | {EVENT_LABELS.get(kind, kind)}\n\n"
+                f"🕒 {tehran_time(release_time)}")
+        footer = channel_link(channel)
+        if footer:
+            body += "\n\n🔗 " + footer
+        if preview:
+            print("\n" + body)
+            continue
+        try:
+            telegram_send(body, token, channel)
+        except (RuntimeError, TimeoutError, URLError, OSError) as exc:
+            LOGGER.warning("Calendar send failed: %s", exc)
+            continue
+        put_meta(db, key, now.isoformat())
+        count += 1
+        time.sleep(0.3)
+    return count
+
+
+def initial_digest(db: sqlite3.Connection, articles: list[Article], token: str,
+                   channel: str, *, max_age_hours: int, min_score: int) -> int:
+    """Publish up to 3 recent, clearly labelled headlines once, even if baselined.
+
+    This is a one-time startup digest, not a breaking-news alert. Never send a
+    previously sent URL, and leave all unselected headlines untouched.
+    """
+    if get_meta(db, "initial_digest_done"):
+        return 0
+    if db.execute("SELECT 1 FROM seen WHERE status = 'sent' LIMIT 1").fetchone():
+        # The bot has already delivered real news, so no startup digest needed.
+        put_meta(db, "initial_digest_done", "skipped: regular news already delivered")
+        return 0
+
+    now = datetime.now(timezone.utc)
+    distinct = {fingerprint(a): a for a in articles}
+    shortlist = []
+    for key, a in distinct.items():
+        if not a.published:
+            continue
+        if not (now - timedelta(hours=max_age_hours) <= a.published <= now + timedelta(hours=2)):
+            continue
+        assessment = assess(a)
+        if assessment.score < min_score:
+            continue
+        row = db.execute("SELECT status FROM seen WHERE fingerprint=?", (key,)).fetchone()
+        if row and row[0] == "sent":
+            continue
+        shortlist.append((key, a, assessment))
+
+    shortlist.sort(key=lambda entry: (
+        entry[2].gold_relevant, entry[2].score,
+        entry[1].published or datetime.min.replace(tzinfo=timezone.utc)
+    ), reverse=True)
+    sent = 0
+    for key, a, assessment in shortlist[:3]:
+        message = "🗞 مرور اخبار مهم اخیر (ارسال اولیه، نه خبر فوری)\n\n" + format_alert(a, assessment, channel, translate=True)
+        try:
+            telegram_send(message, token, channel)
+        except (RuntimeError, TimeoutError, URLError, OSError) as exc:
+            LOGGER.error("Initial digest Telegram delivery failed: %s", exc)
+            break
+        db.execute(
+            "INSERT OR REPLACE INTO seen(fingerprint, first_seen, status) VALUES (?, ?, 'sent')",
+            (key, now.isoformat()),
+        )
+        db.commit()
+        sent += 1
+        time.sleep(1)
+
+    if sent:
+        put_meta(db, "initial_digest_done", now.isoformat())
+        LOGGER.info("Initial digest: %d recent headline(s) sent once", sent)
+    else:
+        LOGGER.info("Initial digest: no suitable recent headlines; nothing sent")
+    return sent
 
 
 def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, max_age_hours: int, min_score: int, max_per_cycle: int) -> tuple[int, int]:
     now = datetime.now(timezone.utc)
+    calendar_sent = calendar_notices(db, token, channel, preview=preview)
     articles, good = fetch_articles()
     if not good:
         LOGGER.error("All feeds unavailable; nothing was marked as read.")
-        return 0, 0
+        return calendar_sent, 0
+    if not preview:
+        record_observations(db, articles, now)
     started_raw = get_meta(db, "started_at")
     first_run = started_raw is None
     if first_run and not preview:
@@ -299,27 +738,60 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
     for a in articles:
         distinct[fingerprint(a)] = a
     candidates = []
+    stats = {"seen": 0, "stale": 0, "baseline": 0, "filtered": 0, "undated": 0, "duplicate": 0}
+    cycle_titles: set[str] = set()
+    cycle_article_titles: list[str] = []
     for key, a in distinct.items():
         if is_seen(db, key):
+            stats["seen"] += 1
+            continue
+        if not a.published and not a.official:
+            stats["undated"] += 1
             continue
         # Avoid flooding the channel with historical items when a feed recovers.
         if a.published and (a.published < now - timedelta(hours=max_age_hours) or a.published > now + timedelta(hours=2)):
+            stats["stale"] += 1
             if not preview:
                 mark_seen(db, key, "stale")
             continue
         if not preview and (first_run or (a.published and a.published < started)):
             mark_seen(db, key, "baseline")
+            stats["baseline"] += 1
             continue
         rating = assess(a)
-        if rating.score < min_score:
+        if OPINION_TITLE.search(a.title):
+            stats["filtered"] += 1
             if not preview:
                 mark_seen(db, key, "filtered")
             continue
+        if rating.score < min_score:
+            stats["filtered"] += 1
+            if not preview:
+                mark_seen(db, key, "filtered")
+            continue
+        tkey = title_key(a)
+        if (tkey in cycle_titles or already_sent_title(db, a)
+                or near_duplicate(db, a)
+                or any(similar_headlines(a.title, title) for title in cycle_article_titles)):
+            stats["duplicate"] += 1
+            continue
+        cycle_titles.add(tkey)
+        cycle_article_titles.append(a.title)
         candidates.append((key, a, rating))
-    candidates.sort(key=lambda r: (r[2].gold_relevant, r[2].score, r[1].published or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    LOGGER.info("Filter diagnostics: total=%d, unseen_candidates=%d, seen=%d, stale=%d, baseline=%d, below_score=%d, undated=%d, duplicate=%d",
+                len(distinct), len(candidates), stats["seen"], stats["stale"], stats["baseline"], stats["filtered"], stats["undated"], stats["duplicate"])
+    candidates.sort(key=lambda r: (
+        bool(MILITARY_ALERT.search(r[1].title)) and r[2].score >= 5,
+        r[2].gold_relevant, r[2].score,
+        r[1].published or datetime.min.replace(tzinfo=timezone.utc)
+    ), reverse=True)
+    day_key = "news_posts_" + now.astimezone(TEHRAN).strftime("%Y%m%d")
+    daily_limit = max(1, int(os.getenv("MAX_DAILY_ALERTS", "80")))
+    already_today = int(get_meta(db, day_key) or 0)
+    allowance = max(0, min(max_per_cycle, daily_limit - already_today))
     sent = 0
-    for key, a, rating in candidates[:max_per_cycle]:
-        alert = format_alert(a, rating)
+    for key, a, rating in candidates[:allowance]:
+        alert = format_alert(a, rating, channel, translate=not preview)
         if preview:
             print("\n" + "="*45 + "\n" + alert + "\n")
         else:
@@ -328,14 +800,19 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
             except (RuntimeError, TimeoutError, URLError, OSError) as exc:
                 LOGGER.error("Telegram send failed. Will retry later: %s", exc)
                 break
-            mark_seen(db, key, "sent")
+            mark_sent(db, key, a)
             sent += 1
-            time.sleep(1)
-    return sent, len(candidates)
+            put_meta(db, day_key, str(already_today + sent))
+            time.sleep(0.6)
+    if not preview and sent == 0 and not candidates and allowance > 0:
+        # One-time startup digest, if no real alerts have ever reached Telegram.
+        sent += initial_digest(db, list(distinct.values()), token, channel,
+                               max_age_hours=max_age_hours, min_score=min_score)
+    return sent + calendar_sent, len(candidates)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Source-linked RSS market alerts for Telegram")
+    p = argparse.ArgumentParser(description="Compact RSS alerts with Tehran time for Telegram")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--test", action="store_true", help="Send one Telegram connection test")
     mode.add_argument("--once", action="store_true", help="Run a single check, then exit")
@@ -348,13 +825,13 @@ def main() -> None:
     if not args.preview and (not token or not channel):
         p.error("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL to .env")
     if args.test:
-        telegram_send("✅ Market Radar متصل شد. این یک پیام آزمایشی است. هیچ معامله‌ای انجام نشده است.", token, channel)
+        telegram_send("✅ اتصال Market Radar برقرار است.\n🕒 " + tehran_time(datetime.now(timezone.utc)) + ("\n\n🔗 " + channel_link(channel) if channel_link(channel) else ""), token, channel)
         print("Telegram test message sent.")
         return
     interval = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "180")))
-    min_score = max(1, int(os.getenv("MIN_SCORE", "5")))
-    max_age_hours = max(1, int(os.getenv("MAX_AGE_HOURS", "24")))
-    max_per_cycle = max(1, int(os.getenv("MAX_ALERTS_PER_CYCLE", "6")))
+    min_score = max(1, int(os.getenv("MIN_SCORE", "4")))
+    max_age_hours = max(1, int(os.getenv("MAX_AGE_HOURS", "12")))
+    max_per_cycle = max(1, int(os.getenv("MAX_ALERTS_PER_CYCLE", "18")))
     db = create_db(Path(":memory:") if args.preview else BASE_DIR / "market_radar.sqlite3")
     try:
         while True:
