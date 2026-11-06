@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
-"""Market Radar v1.8: uncapped news plus one auto-updating Iranian price board.
+"Market Radar v2.0: relevance-filtered news + truthful quote-style price ticker.
 
-Python 3.10+ standard library only. No paid API and no trading signals.
+Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
 from __future__ import annotations
 
@@ -245,8 +244,9 @@ def parse_feed(data: bytes, feed: dict) -> list[Article]:
 
 def assess(a: Article) -> Assessment:
     hits: dict[str, int] = {}
-    title = a.title.lower()
-    summary = a.summary.lower()
+    # Persian zero-width joins must not hide phrases like «شاخص قیمت مصرف‌کننده».
+    title = a.title.lower().replace("\u200c", " ")
+    summary = a.summary.lower().replace("\u200c", " ")
     for topic, rules in PATTERNS.items():
         weight = 0
         for pattern, value in rules:
@@ -267,6 +267,166 @@ def assess(a: Article) -> Assessment:
     tier = "فوری / اهمیت بالا" if score >= 10 else "مهم" if score >= 5 else "کم‌اهمیت"
     return Assessment(score, tier, category, gold_relevant)
 
+
+
+# Editorial quality guard: evaluate the *headline*, not a long feed summary.
+# Some RSS summaries contain unrelated sidebars (for example theatre programmes
+# about war) which made the previous keyword-only filter too permissive.
+# This is a conservative heuristic, not independent fact-checking.
+NON_MARKET_TITLE = re.compile(
+    r"(?:\b(?:tv series|movie|movies|film festival|celebrity|actor|actress|"
+    r"musical|theatre|theater|wedding ceremony|entertainment|sports match|"
+    r"football match|soccer match|streaming series|book review|art exhibition|"
+    r"gold medal|olympics)\b|"
+    r"(?:نمایش(?:نامه|‌نامه)?|تئاتر|فیلم(?:‌سینمایی)?|سریال|سینما|موسیقی|"
+    r"جشنواره(?:‌ی)? (?:هنری|موسیقی|فیلم)|پخش(?:‌| )?(?:نمایش|سریال|فیلم|برنامه)|"
+    r"بازیگر|کنسرت|مراسم عروسی|فوتبال|مسابقه ورزشی|برنامه تلویزیونی|"
+    r"رمان(?:‌| )|مدال طلا|المپیک|"
+    r"کتاب(?:‌| )?(?:داستان|رمان)))",
+    re.I,
+)
+QUESTION_OR_SPECULATION = re.compile(
+    r"(?:[؟?]|^\s*(?:آیا|چرا|چگونه|چه می(?:‌| )?شود اگر|"
+    r"what if|could .{0,65}\?|will .{0,65}\?|is .{0,65}\?)|"
+    r"\b(?:opinion|editorial|explainer|analysis:|what to know|"
+    r"could it happen|predictions? for war|hypothetical|speculation)\b|"
+    r"(?:سناریوهای احتمالی|پیش(?:‌| )?بینی جنگ|بررسی احتمال جنگ|"
+    r"شاید|ممکن است|احتمال دارد|احتمال می(?:‌| )?رود|"
+    r"پیش(?:‌| )?بینی می(?:‌| )?شود|اگر جنگ|فرضیه جنگ|"
+    r"\b(?:could|might|would|possibly|hypothetical|rumou?r|predicts?|forecasts?)\b|"
+    r"\bmay (?:attack|strike|start|trigger|hit|launch|rise|fall)\b|"
+    r"احتمال جنگ چقدر|تحلیل:|یادداشت:|سرمقاله:|"
+    r"در آستانه فاجعه هسته(?:‌| )?ای))",
+    re.I,
+)
+UNVERIFIED_TITLE = re.compile(
+    r"(?:\b(?:unverified|unconfirmed|no evidence|viral rumor|viral rumour|"
+    r"false report|hoax)\b|(?:شایعه|خبر جعلی|بی(?:‌| )?اساس|"
+    r"تأیید(?:‌| )?نشده|تایید(?:‌| )?نشده))",
+    re.I,
+)
+ROUTINE_ADMIN_TITLE = re.compile(
+    r"(?:\b(?:counterfeit banknotes?|banknote statistics?|"
+    r"administrative notice|staff appointment|staff vacancies?)\b|"
+    r"(?:اسکناس(?:‌| )?(?:تقلبی|جعلی)|داده(?:‌| )?های بانکی تقلبی|"
+    r"آمار اسکناس(?:‌| )?(?:جعلی|تقلبی)|انتصاب کارکنان بانک))",
+    re.I,
+)
+LOCAL_NONMARKET_TITLE = re.compile(
+    r"(?:^\s*(?:امام جمعه|خطیب نماز جمعه|سخنران مراسم|"
+    r"سخنگوی هیئت مذهبی)\b|(?:انسجام ملی|حماسه مقاومت|"
+    r"محاسبات دشمن را ناکام|پرونده .*?(?:مراسم عروسی|دادسرای)|"
+    r"سالگرد (?:جنگ|دفاع)|یادواره شهدا))",
+    re.I,
+)
+# A price-only headline is redundant because this bot already edits one
+# consolidated USD/18K-gold/coin message. Market-moving causes still pass.
+DOMESTIC_TICKER_TITLE = re.compile(
+    r"(?:^(?:قیمت امروز|جدول قیمت|نرخ روز|آخرین قیمت)\s+(?:طلا|سکه|دلار|ارز)|"
+    r"^قیمت (?:روز|لحظه(?:‌| )?ای) (?:سکه|دلار|طلای ۱۸)|"
+    r"^قیمت (?:دلار|طلا و سکه|سکه|طلای ۱۸ عیار).{0,75}"
+    r"(?:بازار آزاد|امروز|لحظه(?:‌| )?ای)|"
+    r"^نرخ (?:جدید|امروز|لحظه(?:‌| )?ای) (?:دلار|طلا|سکه))",
+    re.I,
+)
+MARKET_POLICY_ACTION = re.compile(
+    r"(?:\b(?:rate (?:decision|cut|hike)|interest rates?|inflation|"
+    r"payrolls?|unemployment|fomc|cpi|ppi|monetary|tariff|"
+    r"sanctions?|oil|gold|bullion|forex|stocks?|bitcoin|bond yields?)\b|"
+    r"(?:نرخ بهره|تورم|اشتغال|تحریم|نفت|طلا|سکه|دلار|"
+    r"فدرال رزرو|بازار ارز|اونس|سیاست پولی|تعرفه))",
+    re.I,
+)
+GEO_EVENT_ACTION = re.compile(
+    r"(?:\b(?:airstrikes?|missile (?:attacks?|launch(?:es)?|strikes?|fire|fired)|"
+    r"military (?:strike|operation|attack|deployment|exercise)|"
+    r"bombardment|explosions?|invasion|ceasefire|truce|"
+    r"sanctions? (?:imposed|lifted|announced|expanded)|"
+    r"(?:announces?|imposes?|lifts?|expands?) (?:new )?sanctions?|"
+    r"nuclear (?:deal|talks|negotiations|strike|agreement)|"
+    r"peace (?:deal|agreement|talks)|troop (?:deployment|withdrawal)|"
+    r"naval blockade|blockade|drones? (?:struck|attacked)|"
+    r"negotiations? (?:begin|resume|end)|"
+    r"tensions? (?:escalate|rise)|war (?:begins|starts|ends)|"
+    r"(?:attacks?|strikes?) (?:iran|israel|us|military|bases?|tanker)|"
+    r"(?:iran|israel|us) (?:attacks?|strikes?)|"
+    r"declares? war|orders? (?:military )?strikes?|"
+    r"security alert|hormuz (?:closed|closure|blockade|blocked))\b|"
+    r"(?:حمله(?:‌| )?(?:نظامی|موشکی|پهپادی)|حمله (?:به|علیه)|"
+    r"حملات به|حملات موشکی|شلیک.{0,20}موشک|"
+    r"(?:موشک|پهپاد).{0,35}(?:شلیک|اصابت|رهگیری)|"
+    r"انفجار|بمباران|"
+    r"اصابت موشک|آتش(?:‌| )?بس|اعلام جنگ|شروع جنگ|آغاز جنگ|"
+    r"تحریم(?:‌| )?های جدید|وضع تحریم|لغو تحریم|"
+    r"(?:اعمال|تشدید|تمدید|رفع|تصویب).{0,25}تحریم|"
+    r"تحریم.{0,25}(?:اعلام|تشدید|لغو|تصویب|وضع|اعمال)|"
+    r"مذاکرات هسته(?:‌| )?ای|توافق هسته(?:‌| )?ای|"
+    r"مذاکرات (?:ایران|آمریکا|صلح)|مذاکره (?:با|میان)|"
+    r"اعزام (?:نیرو|ناو)|استقرار (?:نیرو|ناو)|"
+    r"بستن تنگه هرمز|مسدود (?:شدن|کردن) تنگه هرمز|"
+    r"تبادل آتش|درگیری (?:نظامی|مرزی)|"
+    r"جنگ [^،.]{1,45} آغاز شد|جنگ [^،.]{1,45} پایان یافت|"
+    r"رزمایش (?:نظامی|دریایی)|تشدید تنش|عملیات نظامی|"
+    r"دستور حمله|آماده(?:‌| )?باش نظامی|حمله سایبری|"
+    r"بازداشت (?:رهبر|فرمانده)|خروج از توافق))",
+    re.I,
+)
+GEO_ANCHOR = re.compile(
+    r"(?:\b(?:iran|israel|america|american|united states|u\.s\.|us |"
+    r"pentagon|hormuz|middle east|persian gulf|red sea|"
+    r"russia|ukraine|iraq|yemen|lebanon|tehran|"
+    r"china|taiwan|venezuela|saudi arabia|gaza|syria|north korea|"
+    r"israeli|iranian|nuclear facility|tanker)\b|"
+    r"(?:ایران|اسرائیل|آمریکا|خلیج فارس|تنگه هرمز|"
+    r"دریای سرخ|اوکراین|روسیه|لبنان|عراق|یمن|تهران|"
+    r"چین|تایوان|ونزوئلا|عربستان|غزه|سوریه|کره شمالی|"
+    r"پایگاه نظامی|نفتکش))",
+    re.I,
+)
+
+
+def news_is_report_worthy(a: Article, rating: Assessment) -> tuple[bool, str]:
+    """Reject off-topic/fiction/speculative headlines before publishing.
+
+    Scores still rank *eligible* market and geopolitical events. Neither a
+    high score from a long RSS summary nor an official source alone overrides
+    this independent relevance and editorial filter.
+    """
+    title = strip_source_suffix(clean_text(a.title)).replace("\u200c", " ")
+    if len(title) < 12:
+        return False, "too_short"
+    if NON_MARKET_TITLE.search(title):
+        return False, "entertainment_or_local"
+    if QUESTION_OR_SPECULATION.search(title) or OPINION_TITLE.search(title):
+        return False, "question_or_opinion"
+    if UNVERIFIED_TITLE.search(title):
+        return False, "unverified_claim"
+    if ROUTINE_ADMIN_TITLE.search(title) or LOCAL_NONMARKET_TITLE.search(title):
+        return False, "routine_or_commentary"
+    if DOMESTIC_TICKER_TITLE.search(title):
+        return False, "redundant_price_ticker"
+
+    # Generic soft language about a war is not news of a new event.
+    market_headline = any(
+        re.search(pattern, title, re.I)
+        for topic in ("gold", "macro", "oil", "stocks", "crypto", "forex")
+        for pattern, _ in PATTERNS[topic]
+    )
+    geopolitical_headline = bool(GEO_EVENT_ACTION.search(title) and GEO_ANCHOR.search(title))
+    # Publish monetary release headlines from official macro sources, but do
+    # not include all peripheral bank-office or regulatory notices.
+    official_release = bool(a.official and a.topic in {"fed", "cpi", "jobs", "ppi"}
+                            and MARKET_POLICY_ACTION.search(title))
+    if not (market_headline or geopolitical_headline or official_release):
+        return False, "no_concrete_market_event"
+    # Headlines like "Fed chair speaks at a conference" do not announce a
+    # decision even though a generic reference to Fed earns keywords.
+    if a.topic == "fed_speech" and not re.search(
+        r"(?:rate cuts?|rate hikes?|inflation|policy|interest rates?|"
+        r"نرخ بهره|تورم|سیاست پولی)", title, re.I
+    ):
+        return False, "generic_speech"
+    return True, "relevant"
 
 def canonical_url(raw: str) -> str:
     parts = urlsplit(raw)
@@ -781,7 +941,7 @@ def initial_digest(db: sqlite3.Connection, articles: list[Article], token: str,
         if not (now - timedelta(hours=max_age_hours) <= a.published <= now + timedelta(hours=2)):
             continue
         assessment = assess(a)
-        if assessment.score < min_score:
+        if assessment.score < min_score or not news_is_report_worthy(a, assessment)[0]:
             continue
         row = db.execute("SELECT status FROM seen WHERE fingerprint=?", (key,)).fetchone()
         if row and row[0] == "sent":
@@ -836,7 +996,8 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
     for a in articles:
         distinct[fingerprint(a)] = a
     candidates = []
-    stats = {"seen": 0, "stale": 0, "baseline": 0, "filtered": 0, "undated": 0, "duplicate": 0}
+    stats = {"seen": 0, "stale": 0, "baseline": 0, "filtered": 0, "irrelevant": 0, "undated": 0, "duplicate": 0}
+    quality_rejections: dict[str, int] = {}
     cycle_titles: set[str] = set()
     cycle_article_titles: list[str] = []
     for key, a in distinct.items():
@@ -867,6 +1028,13 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
             if not preview:
                 mark_seen(db, key, "filtered")
             continue
+        worthy, reason = news_is_report_worthy(a, rating)
+        if not worthy:
+            stats["irrelevant"] += 1
+            quality_rejections[reason] = quality_rejections.get(reason, 0) + 1
+            if not preview:
+                mark_seen(db, key, "irrelevant")
+            continue
         tkey = title_key(a)
         if (tkey in cycle_titles or already_sent_title(db, a)
                 or near_duplicate(db, a)
@@ -876,8 +1044,9 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
         cycle_titles.add(tkey)
         cycle_article_titles.append(a.title)
         candidates.append((key, a, rating))
-    LOGGER.info("Filter diagnostics: total=%d, unseen_candidates=%d, seen=%d, stale=%d, baseline=%d, below_score=%d, undated=%d, duplicate=%d",
-                len(distinct), len(candidates), stats["seen"], stats["stale"], stats["baseline"], stats["filtered"], stats["undated"], stats["duplicate"])
+    LOGGER.info("Filter diagnostics: total=%d, unseen_candidates=%d, seen=%d, stale=%d, baseline=%d, below_score=%d, irrelevant=%d, undated=%d, duplicate=%d",
+                len(distinct), len(candidates), stats["seen"], stats["stale"], stats["baseline"], stats["filtered"], stats["irrelevant"], stats["undated"], stats["duplicate"])
+    LOGGER.info("Editorial filter reasons: %s", json.dumps(quality_rejections, ensure_ascii=False, sort_keys=True))
     candidates.sort(key=lambda r: (
         bool(MILITARY_ALERT.search(r[1].title)) and r[2].score >= 5,
         r[2].gold_relevant, r[2].score,
@@ -985,36 +1154,163 @@ def _price_to_fa(value: float) -> str:
     return to_fa_digits(f"{value:,.0f}").replace(",", "٬")
 
 
+# This public, keyless XAU/USD endpoint is independent of the Iranian market feed.
+# It reports a reference spot price rather than an executable two-way quotation.
+GOLD_SPOT_URL = "https://api.gold-api.com/price/XAU"
+
+
+def _validated_utc_time(raw: object, now: datetime, *, max_days: int = 7) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return None
+        dt = dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    if not (now - timedelta(days=max_days) <= dt <= now + timedelta(minutes=10)):
+        return None
+    return dt
+
+
+def normalize_gold_spot(payload: bytes, *, now: datetime | None = None) -> dict[str, object]:
+    """Validate public gold-api.com XAU spot USD/oz, including its own quote timestamp."""
+    now = now or datetime.now(timezone.utc)
+    raw = json.loads(payload)
+    if not isinstance(raw, dict) or raw.get("symbol") != "XAU":
+        raise ValueError("Gold feed did not return XAU")
+    # Gold-API documents currency=USD; older responses may omit currency.
+    if raw.get("currency", "USD") != "USD":
+        raise ValueError("XAU quote is not in USD")
+    price = raw.get("price")
+    if isinstance(price, bool) or not isinstance(price, (int, float)) or not 200 < float(price) < 20000:
+        raise ValueError("Invalid gold spot quote")
+    dt = _validated_utc_time(raw.get("updatedAt"), now, max_days=7)
+    if dt is None:
+        raise ValueError("Gold spot time missing or invalid")
+    return {"value": float(price), "time": dt, "stale": False}
+
+
+def normalize_extra_quotes(payload: bytes, *, now: datetime | None = None) -> dict[str, dict]:
+    """Optional licensed JSON feed for real Tehran futures and melted-gold rates.
+
+    Expected contract:
+      {"currency":"IRT", "usd_futures_tehran":{"bid": ..., "ask": ...,
+       "trade": ..., "timestamp":"2026-11-06T12:00:00Z"},
+       "melted_gold_cash":{"price": ..., "timestamp":"..."}}
+    A free-market USD reference is never re-labelled as a Tehran futures trade.
+    """
+    now = now or datetime.now(timezone.utc)
+    raw = json.loads(payload)
+    if not isinstance(raw, dict):
+        raise ValueError("Extra feed is not a JSON object")
+    base = raw.get("data", raw)
+    if not isinstance(base, dict) or raw.get("currency", base.get("currency")) != "IRT":
+        raise ValueError("Expected explicitly denominated toman values (IRT)")
+    results = {}
+    future = base.get("usd_futures_tehran")
+    if isinstance(future, dict):
+        ts = _validated_utc_time(future.get("timestamp"), now, max_days=2)
+        fields = [future.get(k) for k in ("bid", "ask", "trade")]
+        if ts and all(type(x) in (int, float) and 1000 < float(x) < 10000000 for x in fields):
+            bid, ask, trade = [float(x) for x in fields]
+            if bid <= ask:
+                results["USD_FUTURES_TEHRAN"] = {
+                    "bid": bid, "ask": ask, "trade": trade, "time": ts,
+                    "stale": bool(future.get("stale", False))}
+    melted = base.get("melted_gold_cash")
+    if isinstance(melted, dict):
+        ts = _validated_utc_time(melted.get("timestamp"), now, max_days=2)
+        v = melted.get("price")
+        if ts and type(v) in (int, float) and 1000000 < float(v) < 10000000000:
+            results["MELTED_GOLD_CASH"] = {
+                "value": float(v), "time": ts, "stale": bool(melted.get("stale", False))}
+    return results
+
+
+def _quote_age_bad(item: dict, now: datetime, max_fresh_minutes: int) -> bool:
+    return bool(item.get("stale")) or (now-item["time"]).total_seconds() > 60*max_fresh_minutes
+
+
+def _jalali_date(gregorian_date) -> str:
+    """Convert Gregorian date to Solar Hijri for ticker quote timestamps."""
+    gy, gm, gd = gregorian_date.year, gregorian_date.month, gregorian_date.day
+    offsets = (0,31,59,90,120,151,181,212,243,273,304,334)
+    if gy > 1600:
+        jy, gy = 979, gy - 1600
+    else:
+        jy, gy = 0, gy - 621
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (365*gy + (gy2+3)//4 - (gy2+99)//100 +
+            (gy2+399)//400 - 80 + gd + offsets[gm-1])
+    jy += 33*(days//12053)
+    days %= 12053
+    jy += 4*(days//1461)
+    days %= 1461
+    if days > 365:
+        jy += (days-1)//365
+        days = (days-1)%365
+    if days < 186:
+        jm, jd = 1 + days//31, 1 + days%31
+    else:
+        jm, jd = 7 + (days-186)//30, 1 + (days-186)%30
+    return f"{jy:04d}/{jm:02d}/{jd:02d}"
+
+
 def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | None = None,
                      max_fresh_minutes: int = 90) -> str:
-    """All prices in one short Telegram message. Last-quote times are explicit."""
+    """Compact price ticker, all figures verifiable, no fabricated future bid/ask/trades."""
     now = now or datetime.now(timezone.utc)
-    lines = ["📊 نرخ دلار، طلا و سکه", ""]
-    stale_symbols = []
+    lines = ["📊 نرخ بازار تهران | دلار، طلا و سکه", ""]
     used_times = []
-    for symbol, label in PRICE_SYMBOLS:
+    stale_count = 0
+    futures = prices.get("USD_FUTURES_TEHRAN")
+    if futures:
+        is_stale = _quote_age_bad(futures, now, max_fresh_minutes)
+        suffix = " ⏳" if is_stale else ""
+        lines += ["⛳️ دلار فردایی تهران" + suffix,
+                  "🔵 خرید: " + _price_to_fa(futures['bid']) + " تومان",
+                  "⭕ فروش: " + _price_to_fa(futures['ask']) + " تومان",
+                  "✅ معامله: " + _price_to_fa(futures['trade']) + " تومان", ""]
+        used_times.append(futures['time'])
+        stale_count += int(is_stale)
+
+    # A free-dollar mid/reference price is not an executable Tehran-futures bid or ask.
+    labels = (
+        ("USD_IRR_FREE", "💵 دلار آزاد"),
+        ("MELTED_GOLD_CASH", "💰 آبشده نقدی"),
+        ("GOLD_18K_IRR", "✨ طلای ۱۸ عیار (گرمی)"),
+        ("COIN_EMAMI_IRR", "🪙 سکه امامی"),
+        ("USDT_IRR", "💠 تتر [USDT]"),
+        ("EUR_IRR_FREE", "💶 یورو آزاد"),
+    )
+    for symbol, label in labels:
         item = prices.get(symbol)
-        if not item:
-            if symbol in CORE_PRICE_SYMBOLS:
-                lines.append(f"{label}: در دسترس نیست")
-            continue
-        age_minutes = (now - item["time"]).total_seconds() / 60
-        stale = item["stale"] or age_minutes > max_fresh_minutes
-        last_label = " ⏳" if stale else ""
-        lines.append(f"{label}: {_price_to_fa(item['value'])} تومان{last_label}")
-        used_times.append(item["time"])
-        if stale:
-            stale_symbols.append(symbol)
+        if item is None:
+            continue  # Never substitute an unrelated price for missing fields.
+        is_stale = _quote_age_bad(item, now, max_fresh_minutes)
+        lines.append(f"{label}: {_price_to_fa(item['value'])} تومان" + (" ⏳" if is_stale else ""))
+        used_times.append(item['time'])
+        stale_count += int(is_stale)
+
+    ounce = prices.get("XAUUSD_SPOT")
+    if ounce:
+        stale = _quote_age_bad(ounce, now, max_fresh_minutes)
+        marker = "⏳" if stale else "🌐"
+        spot = to_fa_digits(f"{ounce['value']:,.2f}").replace(",", "٬")
+        stamp = to_fa_digits(ounce['time'].astimezone(TEHRAN).strftime("%H:%M:%S"))
+        lines += ["", f"{marker} اونس جهانی XAUUSD: {spot} دلار  [{stamp} تهران]"]
+        used_times.append(ounce['time'])
+        stale_count += int(stale)
+
+    # Display time of the OLDEST quote in the board so it never looks fresher than it is.
     if used_times:
-        # Oldest input sets the status of the whole panel, never the fetch time.
         oldest = min(used_times).astimezone(TEHRAN)
-        newest = max(used_times).astimezone(TEHRAN)
-        lines.append("")
-        if stale_symbols:
-            lines.append("⏳ علامت ساعت یعنی آخرین نرخ ثبت‌شده، نه قیمت لحظه‌ای.")
-            lines.append("🕒 قدیمی‌ترین نرخ: " + to_fa_digits(oldest.strftime("%Y/%m/%d %H:%M")) + " تهران")
-        else:
-            lines.append("🕒 آخرین نرخ: " + to_fa_digits(newest.strftime("%H:%M")) + " تهران")
+        jalali_time = _jalali_date(oldest.date()) + " " + oldest.strftime("%H:%M")
+        lines.extend(["", "🕒 قدیمی‌ترین نرخ: " + to_fa_digits(jalali_time) + " تهران"])
+    if stale_count:
+        lines.append("⏳ بعضی نرخ‌ها قدیمی‌اند؛ آخرین قیمت ثبت‌شده نمایش داده شده.")
     footer = channel_link(channel)
     if footer:
         lines.extend(["", "🔗 " + footer])
@@ -1052,6 +1348,26 @@ def update_price_board(db: sqlite3.Connection, token: str, channel: str, *, prev
     except (ValueError, json.JSONDecodeError, URLError, OSError, TimeoutError, HTTPError) as exc:
         LOGGER.warning("Price feed unavailable/invalid; leaving prior board untouched: %s", exc)
         return "unavailable"
+
+    # Independent global spot quotation. A failure must not interrupt Iranian rates.
+    if os.getenv("XAUUSD_ENABLED", "1").strip() not in {"0", "false", "no"}:
+        try:
+            spot = normalize_gold_spot(http_get(GOLD_SPOT_URL, timeout=8), now=now)
+            prices["XAUUSD_SPOT"] = spot
+        except (ValueError, json.JSONDecodeError, URLError, OSError, TimeoutError, HTTPError) as exc:
+            LOGGER.warning("XAUUSD spot unavailable, preserving Iranian quotes: %s", exc)
+
+    # Optionally attach licensed quote fields, if the owner supplies a verified URL.
+    extra_url = os.getenv("MARKET_EXTRA_QUOTES_URL", "").strip()
+    if extra_url:
+        if not extra_url.startswith("https://"):
+            LOGGER.warning("MARKET_EXTRA_QUOTES_URL must use HTTPS")
+        else:
+            try:
+                extras = normalize_extra_quotes(http_get(extra_url, timeout=10), now=now)
+                prices.update(extras)
+            except (ValueError, json.JSONDecodeError, URLError, OSError, TimeoutError, HTTPError) as exc:
+                LOGGER.warning("Optional Tehran futures/melted feed unavailable: %s", exc)
 
     max_age = max(30, int(os.getenv("PRICE_FRESH_MINUTES", "90")))
     body = price_board_text(prices, channel, now=now, max_fresh_minutes=max_age)
@@ -1122,7 +1438,12 @@ def main() -> None:
         return
     interval = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "180")))
     min_score = max(1, int(os.getenv("MIN_SCORE", "4")))
-    max_age_hours = max(1, int(os.getenv("MAX_AGE_HOURS", "12")))
+    # A newsfeed restored after hours of downtime must not dump old headlines.
+    # This editorial freshness cap works with the already-installed v1.8 YAML,
+    # so phone users need to replace only market_radar.py.
+    configured_age = max(1, int(os.getenv("MAX_AGE_HOURS", "24")))
+    freshness_cap = max(1, int(os.getenv("NEWS_FRESHNESS_HOURS", "4")))
+    max_age_hours = min(configured_age, freshness_cap)
     max_per_cycle = max(0, int(os.getenv("MAX_ALERTS_PER_CYCLE", "0")))
     db = create_db(Path(":memory:") if (args.preview or args.prices_preview) else BASE_DIR / "market_radar.sqlite3")
     try:
