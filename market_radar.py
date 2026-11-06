@@ -1,4 +1,4 @@
-"Market Radar v2.0: relevance-filtered news + truthful quote-style price ticker.
+"""Market Radar v2.0": relevance-filtered news + truthful quote-style price ticker.
 
 Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
