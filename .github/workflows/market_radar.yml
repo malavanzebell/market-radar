@@ -47,9 +47,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          MIN_SCORE: '7'
+          MIN_SCORE: '3'
           MAX_AGE_HOURS: '24'
-          MAX_ALERTS_PER_CYCLE: '6'
+          MAX_ALERTS_PER_CYCLE: '18'
         run: python market_radar.py --once
 
       - name: Save news history
