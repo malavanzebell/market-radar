@@ -3,7 +3,7 @@ name: Market Radar News Bot
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
