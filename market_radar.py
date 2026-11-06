@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v2.3: filtered financial news + NerkhAra price API every 30 min.
+"""Market Radar v2.4: Trump/White House and Now14 reporting, plus NerkhAra quotes.
 
 Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
@@ -40,6 +40,18 @@ USER_AGENT = "MarketRadarPersonal/1.0 (+RSS reader; personal Telegram notificati
 # Mix of directly published RSS feeds and labelled Google News search feeds.
 # Not all hosts grant automated access from GitHub runners. Failure is logged.
 FEEDS = [
+    # Fast paths for White House notices and the Israeli Now14 news desk.
+    # An official US source establishes who said something, not whether an
+    # individual policy claim has been independently verified.
+    {"name": "White House | News", "url": "https://www.whitehouse.gov/news/feed/", "topic": "global", "official": True},
+    {"name": "White House | Briefings and Statements", "url": "https://www.whitehouse.gov/briefings-statements/feed/", "topic": "global", "official": True},
+    # Channel 14 / Now 14 official publisher feed; a statement from this
+    # outlet is still a publisher report, not an independently verified event.
+    {"name": "Now 14 Israel | News (Hebrew)", "url": "https://www.now14.co.il/feed/", "topic": "global", "official": False},
+    # Search feeds supplement direct feeds but Google indexing is not live.
+    {"name": "Trump geopolitical headlines via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('(Trump OR "President Trump") (Iran OR Israel OR war OR ceasefire OR sanctions OR tariffs OR oil OR nuclear OR Hormuz OR Fed) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "Trump finance headlines via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('(Trump OR "White House") (economy OR markets OR dollar OR tariffs OR interest rates OR Federal Reserve OR China OR Russia OR Ukraine) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
+    {"name": "Now 14 security via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:now14.co.il (איראן OR ישראל OR טראמפ OR מתקפה OR מלחמה OR טילים OR הפסקת אש) when:1d') + "&hl=he&gl=IL&ceid=IL:he", "topic": "global", "official": False},
     {"name": "Federal Reserve | Monetary Policy", "url": "https://www.federalreserve.gov/feeds/press_monetary.xml", "topic": "fed", "official": True},
     {"name": "Federal Reserve | Speeches", "url": "https://www.federalreserve.gov/feeds/speeches.xml", "topic": "fed_speech", "official": True},
     {"name": "BLS | CPI", "url": "https://www.bls.gov/feed/cpi.rss", "topic": "cpi", "official": True},
@@ -245,6 +257,54 @@ def parse_feed(data: bytes, feed: dict) -> list[Article]:
     return articles
 
 
+# Source-specific editorial gates, evaluated against headlines alone.  These
+# supplement the financial and military filters, not replace them with a
+# blanket rule to publish every Trump mention or every Hebrew headline.
+TRUMP_SUBJECT = re.compile(r"\b(?:donald (?:j\. )?trump|president trump|trump)\b|ترامپ", re.I)
+TRUMP_NEWS_ACTION = re.compile(
+    r"\b(?:says?|said|warns?|warned|orders?|ordered|announces?|announced|"
+    r"confirms?|confirmed|declares?|declared|threatens?|threatened|"
+    r"speaks?|spoke|speech|remarks?|addresses?|press conference|"
+    r"signs?|signed|halts?|halted|approves?|approved|rejects?|rejected|"
+    r"meets?|met|discusses?|discussed|talks?|talked|agrees?|agreed|"
+    r"negotiates?|negotiated|pledges?|pledged|vows?|vowed)\b|"
+    r"(?:گفت|اعلام کرد|سخنرانی|هشدار داد|دستور داد|"
+    r"تأیید کرد|تهدید کرد|دیدار کرد|اظهار داشت|توافق کرد)", re.I)
+TRUMP_MARKET_ANCHOR = re.compile(
+    r"\b(?:iran|israel|middle east|hormuz|iranian|israeli|"
+    r"gulf|war|military|strike|attack|missile|ceasefire|"
+    r"sanctions?|nuclear|russia|ukraine|china|taiwan|"
+    r"oil|opec|markets?|stocks?|tariffs?|trade|inflation|economy|"
+    r"rates?|federal reserve|fed|dollar|currency|crypto|"
+    r"peace deal|troops|pentagon|white house policy)\b|"
+    r"(?:ایران|اسرائیل|جنگ|مذاکرات|آتش بس|"
+    r"اقتصاد|تعرفه|تحریم|نرخ بهره|بازار|طلا|نفت|دلار)", re.I)
+HEBREW_SPECULATIVE_TITLE = re.compile(
+    r"(?:אפשרות של|אפשרות ל|אולי|עשוי|ייתכן|יתכן|תיתכן|מה יקרה|"
+    r"האם |שמועה|ללא אישור|לא מאומת|חשש ממלחמה|בחשש למלחמה)", re.I)
+HEBREW_MIDEAST_ANCHOR = re.compile(
+    r"(?:איראן|איראני|ישראל|ישראלי|ארה\"ב|ארצות הברית|"
+    r"טראמפ|נתניהו|לבנון|עזה|סוריה|חמאס|חיזבאללה|תימן|"
+    r"הורמוז|נפט|דולר|כלכלה|ריבית|סנקציות|רוסיה|אוקראינה)", re.I)
+HEBREW_CONCRETE_EVENT = re.compile(
+    r"(?:תקיפה|תקף|תקפו|הותקף|ירי|שיגור|שיגרו|שוגר|"
+    r"טיל|טילים|כטב\"ם|פיצוץ|הפסקת אש|הסכם|סנקציות|"
+    r"הודיע|הכריז|אמר|אומר|מאיים|איים|פגישה|"
+    r"התקפה|מלחמה|מחיר|מחירי|נפל|עלה|הורדת ריבית|"
+    r"ריבית|החלטה|שיחות|משא ומתן|מבצע צבאי|נעצר|"
+    r"יירט|יירוט|חיסל|חוסל)", re.I)
+
+
+def source_priority_path(a: Article) -> str:
+    """Headline-only basis for source coverage, not confirmation of claims."""
+    title = a.title.replace("\u200c", " ")
+    if TRUMP_SUBJECT.search(title) and TRUMP_NEWS_ACTION.search(title) and TRUMP_MARKET_ANCHOR.search(title):
+        return "trump_public_statement"
+    if not HEBREW_SPECULATIVE_TITLE.search(title) and HEBREW_MIDEAST_ANCHOR.search(title) and HEBREW_CONCRETE_EVENT.search(title):
+        return "hebrew_security_market_development"
+    return ""
+
+
 def assess(a: Article) -> Assessment:
     hits: dict[str, int] = {}
     # Persian zero-width joins must not hide phrases like «شاخص قیمت مصرف‌کننده».
@@ -260,6 +320,14 @@ def assess(a: Article) -> Assessment:
         if weight:
             hits[topic] = weight
     score = BASE_SCORE.get(a.topic, 0) + sum(hits.values())
+    priority = source_priority_path(a)
+    if priority == "trump_public_statement":
+        hits["geopolitics"] = max(5, hits.get("geopolitics", 0))
+        score = max(score, 9)
+    elif priority == "hebrew_security_market_development":
+        hits["geopolitics"] = max(5, hits.get("geopolitics", 0))
+        score = max(score, 8)
+
     if a.topic == "fed_speech" and not hits.get("macro"):
         score = min(score, 3)  # A generic speech is not necessarily market-moving.
     # Gold takes priority even when the article comes from another feed.
@@ -492,7 +560,8 @@ def news_is_report_worthy(a: Article, rating: Assessment) -> tuple[bool, str]:
                             and MARKET_POLICY_ACTION.search(title))
     if market_headline and not CONCRETE_FINANCIAL_DEVELOPMENT.search(title):
         market_headline = False  # Avoid a news item triggered only by a vague noun.
-    if not (market_headline or geopolitical_headline or official_release):
+    priority = source_priority_path(a)
+    if not (market_headline or geopolitical_headline or official_release or priority):
         return False, "no_concrete_market_event"
     # Headlines like "Fed chair speaks at a conference" do not announce a
     # decision even though a generic reference to Fed earns keywords.
@@ -551,7 +620,7 @@ def mark_seen(db: sqlite3.Connection, key: str, status: str) -> None:
 SOURCE_SUFFIX = re.compile(
     r"\s+[-|]\s+(?:Reuters|AP News|Associated Press|BBC(?: News)?|CNBC|The Guardian|"
     r"CoinDesk|Times of Israel|The Times of Israel|The Jerusalem Post|Jerusalem Post|JPost|"
-    r"Ynet(?:news)?|Haaretz|IRNA|ISNA|Tasnim(?: News)?|Mehr(?: News Agency)?|"
+    r"Ynet(?:news)?|Haaretz|Now 14|ערוץ 14|עכשיו 14|IRNA|ISNA|Tasnim(?: News)?|Mehr(?: News Agency)?|"
     r"خبرگزاری (?:ایرنا|ایسنا|مهر|تسنیم|فارس|باشگاه خبرنگاران جوان)|ایرنا|ایسنا|تسنیم|مهر)\s*$", re.I
 )
 
@@ -730,7 +799,8 @@ def translate_title(title: str) -> str:
     if not source or len(source.encode("utf-8")) > 500:
         return title
     try:
-        url = "https://api.mymemory.translated.net/get?" + urlencode({"q": source, "langpair": "en|fa"})
+        language_pair = "he|fa" if re.search(r"[\u0590-\u05ff]", source) else "en|fa"
+        url = "https://api.mymemory.translated.net/get?" + urlencode({"q": source, "langpair": language_pair})
         payload = json.loads(http_get(url, timeout=5))
         translated = clean_text(payload.get("responseData", {}).get("translatedText", ""))
         translated = compact_headline(translated, 175)
@@ -1122,6 +1192,11 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
     LOGGER.info("Filter diagnostics: total=%d, unseen_candidates=%d, seen=%d, stale=%d, baseline=%d, below_score=%d, irrelevant=%d, undated=%d, duplicate=%d",
                 len(distinct), len(candidates), stats["seen"], stats["stale"], stats["baseline"], stats["filtered"], stats["irrelevant"], stats["undated"], stats["duplicate"])
     LOGGER.info("Editorial filter reasons: %s", json.dumps(quality_rejections, ensure_ascii=False, sort_keys=True))
+    LOGGER.info("Priority source headlines received: %s", json.dumps({
+        name: sum(1 for a in distinct.values() if a.source == name)
+        for name in ("White House | News", "White House | Briefings and Statements", "Now 14 Israel | News (Hebrew)",
+                     "Trump geopolitical headlines via Google News", "Trump finance headlines via Google News", "Now 14 security via Google News")
+    }, ensure_ascii=False))
     candidates.sort(key=lambda r: (
         bool(MILITARY_ALERT.search(r[1].title)) and r[2].score >= 5,
         r[2].gold_relevant, r[2].score,
