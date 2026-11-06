@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v1.6: clean Telegram posts and Tehran-only economic event times.
+"""Market Radar v1.8: uncapped news plus one auto-updating Iranian price board.
 
 Python 3.10+ standard library only. No paid API and no trading signals.
 """
@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+from time import monotonic
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, quote, quote_plus, urlsplit, urlunsplit
@@ -392,18 +393,55 @@ def mark_sent(db: sqlite3.Connection, key: str, a: Article) -> None:
 
 
 def telegram_send(text: str, token: str, channel: str) -> None:
+    """Send text and optionally a red inline button for exceptional alerts.
+
+    The *only* button target is the user's own public Telegram channel.
+    On a Telegram API rejecting button styling, retry without the keyboard.
+    """
     from urllib.request import urlopen as post_open
     from urllib.parse import urlencode as encode
-    payload = encode({"chat_id": channel, "text": text, "disable_notification": "false", "link_preview_options": json.dumps({"is_disabled": True})}).encode("utf-8")
-    req = Request(f"https://api.telegram.org/bot{token}/sendMessage", data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
+
+    fields = {
+        "chat_id": channel,
+        "text": text,
+        "disable_notification": "false",
+        "link_preview_options": json.dumps({"is_disabled": True}),
+    }
+    footer = channel_link(channel)
+    if text.startswith("🔴") and footer and os.getenv("URGENT_RED_BUTTON", "1") != "0":
+        button_text = "⚠️ گزارش اولیه" if "گزارش اولیه" in text.split("\n", 1)[0] else "🚨 فوری"
+        fields["reply_markup"] = json.dumps({
+            "inline_keyboard": [[{"text": button_text, "url": footer, "style": "danger"}]],
+        }, ensure_ascii=False)
+
+    def post(payload: dict[str, str]) -> None:
+        req = Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=encode(payload).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         with post_open(req, timeout=20) as response:
             body = json.loads(response.read())
+        if not body.get("ok"):
+            raise RuntimeError(f"Telegram rejected message: {str(body)[:300]}")
+
+    try:
+        post(fields)
+        return
     except HTTPError as exc:
-        msg = exc.read().decode("utf-8", errors="replace")[:250]
-        raise RuntimeError(f"Telegram HTTP {exc.code}: {msg}") from exc
-    if not body.get("ok"):
-        raise RuntimeError(f"Telegram rejected message: {str(body)[:300]}")
+        # Older Telegram infrastructure/clients may not support button style.
+        # A rejected HTTP 400 means no message was sent, so fallback is safe.
+        if exc.code == 400 and "reply_markup" in fields:
+            LOGGER.warning("Telegram did not accept the styled button; sending plain message")
+            fields.pop("reply_markup")
+            try:
+                post(fields)
+                return
+            except HTTPError as fallback_exc:
+                err = fallback_exc.read().decode("utf-8", errors="replace")[:250]
+                raise RuntimeError(f"Telegram HTTP {fallback_exc.code}: {err}") from fallback_exc
+        err = exc.read().decode("utf-8", errors="replace")[:250]
+        raise RuntimeError(f"Telegram HTTP {exc.code}: {err}") from exc
 
 
 def channel_link(channel: str) -> str:
@@ -506,18 +544,38 @@ def exceptional_prefix(a: Article, rating: Assessment) -> str:
     return ""
 
 
-def format_alert(a: Article, rating: Assessment, channel: str = "", *, translate: bool = False) -> str:
-    """Ordinary story: one short headline and the owner's channel link.
+def importance_marker(a: Article, rating: Assessment) -> str:
+    """Color shows editorial priority, not independent verification or certainty.
 
-    News article publication time, arbitrary category labels, and source names
-    are intentionally omitted. Only separate scheduled-economic notices
-    display an event date/time converted to Asia/Tehran.
+    Only extraordinary events are red; regular high-score relevance is orange
+    or yellow. Telegram doesn't allow coloring chat-bubble backgrounds.
+    """
+    exceptional = exceptional_prefix(a, rating)
+    if exceptional == "⚠️ گزارش اولیه":
+        return "🔴 ⚠️ گزارش اولیه"
+    if exceptional == "🚨 خبر مهم":
+        return "🔴 🚨 فوری"
+    if rating.score >= 12:
+        return "🟠"
+    if rating.score >= 8:
+        return "🟡"
+    return "⚪"
+
+
+def format_alert(a: Article, rating: Assessment, channel: str = "", *, translate: bool = False) -> str:
+    """Compact headline with severity marker and only the user's channel URL.
+
+    Ordinary articles intentionally omit timestamps and publisher names.
+    Only dedicated economic calendar alerts have Tehran dates/times.
     """
     headline = compact_headline(a.title)
     if translate:
         headline = translate_title(headline)
-    prefix = exceptional_prefix(a, rating)
-    body = (prefix + "\n\n" if prefix else "") + headline
+    marker = importance_marker(a, rating)
+    if marker.startswith("🔴"):
+        body = marker + "\n\n" + headline
+    else:
+        body = marker + " " + headline
     footer = channel_link(channel)
     if footer:
         body += "\n\n🔗 " + footer
@@ -826,14 +884,25 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
         r[1].published or datetime.min.replace(tzinfo=timezone.utc)
     ), reverse=True)
     day_key = "news_posts_" + now.astimezone(TEHRAN).strftime("%Y%m%d")
-    daily_limit = max(1, int(os.getenv("MAX_DAILY_ALERTS", "80")))
+    # 0 means no artificial alert-count ceiling. Candidates not sent by the
+    # runtime budget remain eligible in the next scheduled run.
+    daily_limit = max(0, int(os.getenv("MAX_DAILY_ALERTS", "0")))
     already_today = int(get_meta(db, day_key) or 0)
-    allowance = max(0, min(max_per_cycle, daily_limit - already_today))
+    allowance = len(candidates)
+    if max_per_cycle:
+        allowance = min(allowance, max_per_cycle)
+    if daily_limit:
+        allowance = min(allowance, max(0, daily_limit - already_today))
     sent = 0
+    cycle_budget = max(60, int(os.getenv("MAX_CYCLE_SECONDS", "420")))
+    send_start = monotonic()
     for key, a, rating in candidates[:allowance]:
+        if monotonic() - send_start >= cycle_budget:
+            LOGGER.info("Runtime budget reached; %d pending headline(s) stay eligible for the next scan", allowance - sent)
+            break
         alert = format_alert(a, rating, channel, translate=not preview)
         if preview:
-            print("\n" + "="*45 + "\n" + alert + "\n")
+            print("\n" + "=" * 45 + "\n" + alert + "\n")
         else:
             try:
                 telegram_send(alert, token, channel)
@@ -843,12 +912,193 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
             mark_sent(db, key, a)
             sent += 1
             put_meta(db, day_key, str(already_today + sent))
-            time.sleep(0.6)
+            # Telegram advises not exceeding ~1 message/s in one chat.
+            time.sleep(1.2)
+    LOGGER.info("Publishing: %d sent this scan, %d selected, daily limit=%s, per-cycle limit=%s", sent, len(candidates), daily_limit or "none", max_per_cycle or "none")
     if not preview and sent == 0 and not candidates and allowance > 0:
         # One-time startup digest, if no real alerts have ever reached Telegram.
         sent += initial_digest(db, list(distinct.values()), token, channel,
                                max_age_hours=max_age_hours, min_score=min_score)
     return sent + calendar_sent, len(candidates)
+
+
+
+
+# Price board: public no-key Iranian market data. Provider data updates at its
+# own rate (~30 minutes), independently of the 5-minute GitHub check. Prices
+# are NOT financial quotes or guaranteed real-time executions.
+PRICE_FEED_URL = "https://raw.githubusercontent.com/iran-market/iran-market.github.io/main/data/popular.json"
+PRICE_SYMBOLS = (
+    ("USD_IRR_FREE", "💵 دلار آزاد"),
+    ("GOLD_18K_IRR", "🥇 طلای ۱۸ عیار (هر گرم)"),
+    ("COIN_EMAMI_IRR", "🪙 سکه امامی"),
+    ("EUR_IRR_FREE", "💶 یورو آزاد"),
+    ("USDT_IRR", "💠 تتر"),
+)
+CORE_PRICE_SYMBOLS = {"USD_IRR_FREE", "GOLD_18K_IRR", "COIN_EMAMI_IRR"}
+
+
+def _price_record_time(record: dict) -> datetime | None:
+    raw = record.get("timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def normalize_price_feed(payload: bytes, *, now: datetime | None = None) -> dict[str, dict]:
+    """Strictly validate price, currency, quote timestamp, and symbol."""
+    now = now or datetime.now(timezone.utc)
+    raw = json.loads(payload)
+    records = raw.get("data")
+    if not isinstance(records, list):
+        raise ValueError("Price feed is missing data[]")
+    selected = {}
+    allowed = {symbol for symbol, _ in PRICE_SYMBOLS}
+    for record in records:
+        if not isinstance(record, dict) or record.get("symbol") not in allowed:
+            continue
+        if record.get("currency") != "IRT":
+            continue  # No silent rial/toman conversion from an unexpected feed.
+        value = record.get("price")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        value = float(value)
+        if not (0 < value < 1_000_000_000_000):
+            continue
+        quote_time = _price_record_time(record)
+        if quote_time is None or quote_time > now + timedelta(minutes=10):
+            continue
+        # Reject numbers far too old even for a "last available" quote.
+        if now - quote_time > timedelta(days=14):
+            continue
+        selected[record["symbol"]] = {"value": value, "time": quote_time, "stale": bool(record.get("stale"))}
+    if not CORE_PRICE_SYMBOLS.issubset(selected):
+        raise ValueError("Price feed does not have all three required rates (USD, 18K gold, Emami coin)")
+    return selected
+
+
+def _price_to_fa(value: float) -> str:
+    return to_fa_digits(f"{value:,.0f}").replace(",", "٬")
+
+
+def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | None = None,
+                     max_fresh_minutes: int = 90) -> str:
+    """All prices in one short Telegram message. Last-quote times are explicit."""
+    now = now or datetime.now(timezone.utc)
+    lines = ["📊 نرخ دلار، طلا و سکه", ""]
+    stale_symbols = []
+    used_times = []
+    for symbol, label in PRICE_SYMBOLS:
+        item = prices.get(symbol)
+        if not item:
+            if symbol in CORE_PRICE_SYMBOLS:
+                lines.append(f"{label}: در دسترس نیست")
+            continue
+        age_minutes = (now - item["time"]).total_seconds() / 60
+        stale = item["stale"] or age_minutes > max_fresh_minutes
+        last_label = " ⏳" if stale else ""
+        lines.append(f"{label}: {_price_to_fa(item['value'])} تومان{last_label}")
+        used_times.append(item["time"])
+        if stale:
+            stale_symbols.append(symbol)
+    if used_times:
+        # Oldest input sets the status of the whole panel, never the fetch time.
+        oldest = min(used_times).astimezone(TEHRAN)
+        newest = max(used_times).astimezone(TEHRAN)
+        lines.append("")
+        if stale_symbols:
+            lines.append("⏳ علامت ساعت یعنی آخرین نرخ ثبت‌شده، نه قیمت لحظه‌ای.")
+            lines.append("🕒 قدیمی‌ترین نرخ: " + to_fa_digits(oldest.strftime("%Y/%m/%d %H:%M")) + " تهران")
+        else:
+            lines.append("🕒 آخرین نرخ: " + to_fa_digits(newest.strftime("%H:%M")) + " تهران")
+    footer = channel_link(channel)
+    if footer:
+        lines.extend(["", "🔗 " + footer])
+    return "\n".join(lines)
+
+
+def _telegram_price_request(method: str, token: str, values: dict[str, str]) -> dict:
+    data = urlencode(values).encode("utf-8")
+    req = Request(f"https://api.telegram.org/bot{token}/{method}", data=data,
+                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read())
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"Telegram {method} HTTP {exc.code}: {detail}") from exc
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram {method}: {str(payload)[:450]}")
+    return payload
+
+
+def update_price_board(db: sqlite3.Connection, token: str, channel: str, *, preview: bool = False,
+                       now: datetime | None = None) -> str:
+    """One consolidated message per Tehran day, edited only on material updates.
+
+    Provider errors leave prior post intact; the news workflow remains independent.
+    """
+    if os.getenv("PRICES_ENABLED", "1").strip().lower() in {"0", "false", "no"}:
+        return "disabled"
+    now = now or datetime.now(timezone.utc)
+    try:
+        # Query the public data file once. No paid API key needed.
+        data = http_get(PRICE_FEED_URL, timeout=14)
+        prices = normalize_price_feed(data, now=now)
+    except (ValueError, json.JSONDecodeError, URLError, OSError, TimeoutError, HTTPError) as exc:
+        LOGGER.warning("Price feed unavailable/invalid; leaving prior board untouched: %s", exc)
+        return "unavailable"
+
+    max_age = max(30, int(os.getenv("PRICE_FRESH_MINUTES", "90")))
+    body = price_board_text(prices, channel, now=now, max_fresh_minutes=max_age)
+    if preview:
+        print("\n===== PRICE BOARD PREVIEW =====\n" + body + "\n")
+        return "preview"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    day = now.astimezone(TEHRAN).strftime("%Y-%m-%d")
+    prev_day = get_meta(db, "price_board_day")
+    prev_id = get_meta(db, "price_board_message_id")
+    prev_hash = get_meta(db, "price_board_hash")
+    if prev_day == day and prev_id and prev_hash == digest:
+        LOGGER.info("Price board unchanged; Telegram edit skipped")
+        return "unchanged"
+
+    base = {"chat_id": channel, "text": body, "link_preview_options": json.dumps({"is_disabled": True})}
+    if prev_day == day and prev_id:
+        try:
+            _telegram_price_request("editMessageText", token, {**base, "message_id": str(int(prev_id))})
+            put_meta(db, "price_board_hash", digest)
+            LOGGER.info("Price board message %s edited with latest verified quotes", prev_id)
+            return "edited"
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "message is not modified" in msg:
+                put_meta(db, "price_board_hash", digest)
+                return "unchanged"
+            # When a message has been manually deleted, replace it once.
+            if not ("message to edit not found" in msg or "message can't be edited" in msg
+                    or "message identifier is not specified" in msg):
+                LOGGER.error("Price board edit failed; not creating duplicate post: %s", exc)
+                return "edit_failed"
+
+    try:
+        reply = _telegram_price_request("sendMessage", token, base)
+        msg_id = reply.get("result", {}).get("message_id")
+        if not isinstance(msg_id, int) or msg_id < 1:
+            LOGGER.error("Telegram returned no message_id; price post was sent but cannot be tracked")
+            return "sent_untracked"
+        put_meta(db, "price_board_message_id", str(msg_id))
+        put_meta(db, "price_board_day", day)
+        put_meta(db, "price_board_hash", digest)
+        LOGGER.info("Price board posted in one message, id=%s", msg_id)
+        return "posted"
+    except (RuntimeError, URLError, OSError, TimeoutError) as exc:
+        LOGGER.error("Price board send failed: %s", exc)
+        return "send_failed"
 
 
 def main() -> None:
@@ -857,12 +1107,14 @@ def main() -> None:
     mode.add_argument("--test", action="store_true", help="Send one Telegram connection test")
     mode.add_argument("--once", action="store_true", help="Run a single check, then exit")
     mode.add_argument("--preview", action="store_true", help="Check feeds without posting or saving anything")
+    mode.add_argument("--prices-once", action="store_true", help="Only create/edit the consolidated price message")
+    mode.add_argument("--prices-preview", action="store_true", help="Preview public prices without sending Telegram posts")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     load_env(BASE_DIR / ".env")
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     channel = os.getenv("TELEGRAM_CHANNEL", "").strip()
-    if not args.preview and (not token or not channel):
+    if not (args.preview or args.prices_preview) and (not token or not channel):
         p.error("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL to .env")
     if args.test:
         telegram_send("✅ اتصال Market Radar برقرار است." + ("\n\n🔗 " + channel_link(channel) if channel_link(channel) else ""), token, channel)
@@ -871,10 +1123,19 @@ def main() -> None:
     interval = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "180")))
     min_score = max(1, int(os.getenv("MIN_SCORE", "4")))
     max_age_hours = max(1, int(os.getenv("MAX_AGE_HOURS", "12")))
-    max_per_cycle = max(1, int(os.getenv("MAX_ALERTS_PER_CYCLE", "18")))
-    db = create_db(Path(":memory:") if args.preview else BASE_DIR / "market_radar.sqlite3")
+    max_per_cycle = max(0, int(os.getenv("MAX_ALERTS_PER_CYCLE", "0")))
+    db = create_db(Path(":memory:") if (args.preview or args.prices_preview) else BASE_DIR / "market_radar.sqlite3")
     try:
+        if args.prices_once or args.prices_preview:
+            status = update_price_board(db, token, channel, preview=args.prices_preview)
+            LOGGER.info("Price-only update status: %s", status)
+            return
         while True:
+            # Rates are independent of RSS, so even when news feeds fail the
+            # price bulletin gets its scheduled update.
+            if not args.preview:
+                status = update_price_board(db, token, channel)
+                LOGGER.info("Price bulletin: %s", status)
             sent, candidates = cycle(db, token, channel, preview=args.preview, max_age_hours=max_age_hours, min_score=min_score, max_per_cycle=max_per_cycle)
             LOGGER.info("Cycle finished: %d sent, %d candidates", sent, candidates)
             if args.once or args.preview:
