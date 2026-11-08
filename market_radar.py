@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v2.5: market-news feeds + verified gold/coin bubble percentages.
+"""Market Radar v2.7: spaced price ticker + clean bubble board and RSS photos.
 
 Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
@@ -182,6 +182,7 @@ class Article:
     source: str
     topic: str
     official: bool
+    image_url: str = ""  # RSS publisher-supplied image; empty means send text
 
 
 @dataclass(frozen=True)
@@ -236,6 +237,45 @@ def parse_date(s: str) -> Optional[datetime]:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
+def valid_news_image_url(url: str) -> bool:
+    """Permit only public-looking HTTPS photo links (never local/internal hosts)."""
+    if not isinstance(url, str) or len(url) > 2048:
+        return False
+    try:
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower().strip(".")
+        if parts.scheme.lower() != "https" or not host or parts.username or parts.password:
+            return False
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            return False
+        if re.fullmatch(r"[0-9.]+", host) or ":" in host:
+            return False  # IP literals and potential local IP targets
+        return "." in host
+    except ValueError:
+        return False
+
+
+def rss_news_image(item: ET.Element) -> str:
+    """Find image explicitly associated with an RSS/Atom item, if provided."""
+    for field in item:
+        name = field.tag.split("}")[-1].lower()
+        if name == "group":  # media:group contains media:content
+            fields = list(field)
+        else:
+            fields = [field]
+        for child in fields:
+            child_name = child.tag.split("}")[-1].lower()
+            url = child.attrib.get("url") or child.attrib.get("href") or ""
+            kind = child.attrib.get("type", "").lower()
+            medium = child.attrib.get("medium", "").lower()
+            is_image = (child_name in {"thumbnail", "image"}
+                        or (child_name == "enclosure" and kind.startswith("image/"))
+                        or (child_name == "content" and (kind.startswith("image/") or medium == "image")))
+            if is_image and valid_news_image_url(url):
+                return url
+    return ""
+
+
 def parse_feed(data: bytes, feed: dict) -> list[Article]:
     root = ET.fromstring(data)
     articles = []
@@ -253,7 +293,7 @@ def parse_feed(data: bytes, feed: dict) -> list[Article]:
         summary = clean_text(child_text(node, {"description", "summary", "content", "encoded"}))
         pub = parse_date(child_text(node, {"pubdate", "published", "updated", "date"}))
         if title and url.startswith(("https://", "http://")):
-            articles.append(Article(title, url, summary[:1200], pub, feed["name"], feed["topic"], feed["official"]))
+            articles.append(Article(title, url, summary[:1200], pub, feed["name"], feed["topic"], feed["official"], rss_news_image(node)))
     return articles
 
 
@@ -748,6 +788,47 @@ def telegram_send(text: str, token: str, channel: str) -> None:
         raise RuntimeError(f"Telegram HTTP {exc.code}: {err}") from exc
 
 
+def telegram_send_news(text: str, token: str, channel: str, image_url: str = "") -> None:
+    """Send a publisher-associated RSS image, otherwise preserve plain-text news.
+
+    A rejected photo URL falls back to existing text delivery, avoiding news loss.
+    No image URL, source name or article link is added to the visible caption.
+    """
+    if (os.getenv("NEWS_IMAGES_ENABLED", "1").lower() in {"0", "false", "no"}
+            or not valid_news_image_url(image_url) or len(text) > 1024):
+        telegram_send(text, token, channel)
+        return
+    payload = {
+        "chat_id": channel,
+        "photo": image_url,
+        "caption": text,
+        "disable_notification": "false",
+    }
+    footer = channel_link(channel)
+    if text.startswith("🔴") and footer and os.getenv("URGENT_RED_BUTTON", "1") != "0":
+        label = "⚠️ گزارش اولیه" if "گزارش اولیه" in text.split("\n", 1)[0] else "🚨 فوری"
+        payload["reply_markup"] = json.dumps({
+            "inline_keyboard": [[{"text": label, "url": footer, "style": "danger"}]],
+        }, ensure_ascii=False)
+    request = Request(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data=urlencode(payload).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            result = json.loads(response.read())
+        if not result.get("ok"):
+            raise RuntimeError("Telegram rejected photo submission")
+        LOGGER.info("News published with RSS image")
+    except HTTPError as exc:
+        if exc.code != 400:
+            err = exc.read().decode("utf-8", errors="replace")[:250]
+            raise RuntimeError(f"Telegram photo HTTP {exc.code}: {err}") from exc
+        LOGGER.info("RSS photo unsupported by Telegram; sending news as text")
+        telegram_send(text, token, channel)
+
+
 def channel_link(channel: str) -> str:
     """Only the user's public Telegram channel URL is included in posts."""
     channel = channel.strip()
@@ -1224,7 +1305,7 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
             print("\n" + "=" * 45 + "\n" + alert + "\n")
         else:
             try:
-                telegram_send(alert, token, channel)
+                telegram_send_news(alert, token, channel, a.image_url)
             except (RuntimeError, TimeoutError, URLError, OSError) as exc:
                 LOGGER.error("Telegram send failed. Will retry later: %s", exc)
                 break
@@ -1528,6 +1609,8 @@ def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | N
         if symbol in bubble_metrics:
             pct, amount = bubble_metrics[symbol]
             lines.append(_bubble_caption(pct, amount, fx_spread=(symbol == "USD_IRR_FREE")))
+        # One empty line between prices. Keep each bubble directly under its rate.
+        lines.append("")
         used_times.append(item['time'])
         stale_count += int(is_stale)
 
@@ -1537,21 +1620,20 @@ def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | N
         marker = "⏳" if stale else "🌐"
         spot = to_fa_digits(f"{ounce['value']:,.2f}").replace(",", "٬")
         stamp = to_fa_digits(ounce['time'].astimezone(TEHRAN).strftime("%H:%M:%S"))
-        lines += ["", f"{marker} اونس جهانی XAUUSD: {spot} دلار  [{stamp} تهران]"]
+        if lines[-1] != "":
+            lines.append("")
+        lines.append(f"{marker} اونس جهانی XAUUSD: {spot} دلار  [{stamp} تهران]")
         used_times.append(ounce['time'])
         stale_count += int(stale)
-
-    if bubble_metrics:
-        lines.extend(["", "📐 مبنای حباب: اونس جهانی × دلار آزاد، بدون هزینه ضرب و کارمزد."])
-        if "USD_IRR_FREE" in bubble_metrics:
-            lines.append("اختلاف دلار و تتر، حباب ذاتی دلار نیست.")
 
     # Display time of the OLDEST quote in the board so it never looks fresher than it is.
     if used_times:
         oldest_utc = min(used_times)
         oldest = oldest_utc.astimezone(TEHRAN)
         jalali_time = _jalali_date(oldest.date()) + " " + oldest.strftime("%H:%M")
-        lines.extend(["", "🕒 قدیمی‌ترین نرخ: " + to_fa_digits(jalali_time) + " تهران"])
+        if lines[-1] != "":
+            lines.append("")
+        lines.append("🕒 قدیمی‌ترین نرخ: " + to_fa_digits(jalali_time) + " تهران")
     if stale_count:
         lines.append("⏳ بعضی نرخ‌ها قدیمی‌اند؛ آخرین نرخ ثبت‌شده نمایش داده شده.")
     # Required by the NerkhAra free JSON API terms. This is displayed only
