@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v2.4: Trump/White House and Now14 reporting, plus NerkhAra quotes.
+"""Market Radar v2.5: market-news feeds + verified gold/coin bubble percentages.
 
 Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
@@ -1324,6 +1324,90 @@ def _price_to_fa(value: float) -> str:
     return to_fa_digits(f"{value:,.0f}").replace(",", "٬")
 
 
+# Theoretical metal values, EXCLUDING coin minting, VAT, commissions and spreads.
+# A troy ounce is 31.1034768 grams. Emami coin contains 8.133g of 900-fine gold.
+# An Iranian gold mesghal quotation is for 4.6083g of 705-fine gold.
+TROY_OUNCE_GRAMS = 31.1034768
+EMAMI_COIN_GRAMS = 8.133
+EMAMI_COIN_GOLD_FRACTION = 0.900
+MESGHAL_GRAMS = 4.6083
+MESGHAL_GOLD_FRACTION = 0.705
+
+
+def _fresh_quote(prices: dict[str, dict], symbol: str,
+                 now: datetime, max_age_minutes: int) -> dict | None:
+    item = prices.get(symbol)
+    if not isinstance(item, dict):
+        return None
+    value, stamp = item.get("value"), item.get("time")
+    if (type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+            or not isinstance(stamp, datetime) or stamp.tzinfo is None
+            or item.get("stale")):
+        return None
+    age = (now - stamp).total_seconds()
+    if age < -600 or age > 60 * max_age_minutes:
+        return None
+    return item
+
+
+def calculate_bubble_metrics(prices: dict[str, dict], *, now: datetime | None = None,
+                             max_fresh_minutes: int = 90,
+                             max_quote_skew_minutes: int = 45) -> dict[str, tuple[float, float]]:
+    """Return (percentage, toman difference) only for comparable *fresh* quotes.
+
+    Gold and coin baseline is metal melt value from XAUUSD and free-market USD.
+    USD itself has no analogous metal intrinsic value: USD/USDT yields only a
+    labelled market-price spread, explicitly NOT a 'dollar bubble'.
+    No synthetic readings are produced for missing or out-of-sync quotes.
+    """
+    now = now or datetime.now(timezone.utc)
+    result: dict[str, tuple[float, float]] = {}
+    usd = _fresh_quote(prices, "USD_IRR_FREE", now, max_fresh_minutes)
+    xau = _fresh_quote(prices, "XAUUSD_SPOT", now, max_fresh_minutes)
+    if usd and xau:
+        reference_quotes = (usd, xau)
+        ounce_in_toman = xau["value"] * usd["value"]
+        metal_values = {
+            "GOLD_18K_IRR": ounce_in_toman * .750 / TROY_OUNCE_GRAMS,
+            "COIN_EMAMI_IRR": ounce_in_toman * EMAMI_COIN_GRAMS * EMAMI_COIN_GOLD_FRACTION / TROY_OUNCE_GRAMS,
+            "GOLD_MESGHAL_IRR": ounce_in_toman * MESGHAL_GRAMS * MESGHAL_GOLD_FRACTION / TROY_OUNCE_GRAMS,
+        }
+        for symbol, intrinsic in metal_values.items():
+            market = _fresh_quote(prices, symbol, now, max_fresh_minutes)
+            if not market:
+                continue
+            stamps = [q["time"] for q in (*reference_quotes, market)]
+            if (max(stamps) - min(stamps)).total_seconds() > 60 * max_quote_skew_minutes:
+                continue
+            if not math.isfinite(intrinsic) or intrinsic <= 0:
+                continue
+            amount = market["value"] - intrinsic
+            percentage = 100 * amount / intrinsic
+            # A mismatch this large usually reflects mixed quote units or a
+            # corrupt source. Do not publish a misleading 'bubble' value.
+            if not math.isfinite(percentage) or abs(percentage) >= 75:
+                continue
+            result[symbol] = percentage, amount
+
+    usdt = _fresh_quote(prices, "USDT_IRR", now, max_fresh_minutes)
+    if usd and usdt and abs((usd["time"] - usdt["time"]).total_seconds()) <= 60 * max_quote_skew_minutes:
+        amount = usd["value"] - usdt["value"]
+        percentage = 100 * amount / usdt["value"]
+        if math.isfinite(percentage) and abs(percentage) < 75:
+            result["USD_IRR_FREE"] = percentage, amount
+    return result
+
+
+def _bubble_caption(percent: float, amount: float, *, fx_spread: bool = False) -> str:
+    label = "اختلاف دلار با تتر" if fx_spread else "حباب"
+    direction = "مثبت" if percent >= 0 else "منفی"
+    icon = "🔺" if percent >= 0 else "🔻"
+    sign = "+" if percent >= 0 else "−"
+    percent_fa = to_fa_digits(f"{abs(percent):.2f}").replace(".", "٫")
+    amount_fa = _price_to_fa(abs(amount))
+    return f"   {icon} {label} {direction}: {sign}{percent_fa}٪ | {sign}{amount_fa} تومان"
+
+
 def _validated_utc_time(raw: object, now: datetime, *, max_days: int = 7) -> datetime | None:
     if not isinstance(raw, str) or not raw:
         return None
@@ -1412,6 +1496,8 @@ def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | N
     lines = ["📊 نرخ بازار تهران | دلار، طلا و سکه", ""]
     used_times = []
     stale_count = 0
+    bubble_metrics = calculate_bubble_metrics(prices, now=now,
+                                              max_fresh_minutes=max_fresh_minutes)
     futures = prices.get("USD_FUTURES_TEHRAN")
     if futures:
         is_stale = _quote_age_bad(futures, now, max_fresh_minutes)
@@ -1439,6 +1525,9 @@ def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | N
             continue  # Never substitute an unrelated price for missing fields.
         is_stale = _quote_age_bad(item, now, max_fresh_minutes)
         lines.append(f"{label}: {_price_to_fa(item['value'])} تومان" + (" ⏳" if is_stale else ""))
+        if symbol in bubble_metrics:
+            pct, amount = bubble_metrics[symbol]
+            lines.append(_bubble_caption(pct, amount, fx_spread=(symbol == "USD_IRR_FREE")))
         used_times.append(item['time'])
         stale_count += int(is_stale)
 
@@ -1451,6 +1540,11 @@ def price_board_text(prices: dict[str, dict], channel: str, *, now: datetime | N
         lines += ["", f"{marker} اونس جهانی XAUUSD: {spot} دلار  [{stamp} تهران]"]
         used_times.append(ounce['time'])
         stale_count += int(stale)
+
+    if bubble_metrics:
+        lines.extend(["", "📐 مبنای حباب: اونس جهانی × دلار آزاد، بدون هزینه ضرب و کارمزد."])
+        if "USD_IRR_FREE" in bubble_metrics:
+            lines.append("اختلاف دلار و تتر، حباب ذاتی دلار نیست.")
 
     # Display time of the OLDEST quote in the board so it never looks fresher than it is.
     if used_times:
