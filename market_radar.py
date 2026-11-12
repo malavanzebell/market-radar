@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Market Radar v2.7: spaced price ticker + clean bubble board and RSS photos.
+"""Market Radar v2.8: Persian-only news, semantic de-duplication, C14 feed and source credit.
 
 Python 3.10+ stdlib only. Never invents bid, ask, trades, or prices.
 """
@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+import unicodedata
 from time import monotonic
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -47,11 +48,13 @@ FEEDS = [
     {"name": "White House | Briefings and Statements", "url": "https://www.whitehouse.gov/briefings-statements/feed/", "topic": "global", "official": True},
     # Channel 14 / Now 14 official publisher feed; a statement from this
     # outlet is still a publisher report, not an independently verified event.
-    {"name": "Now 14 Israel | News (Hebrew)", "url": "https://www.now14.co.il/feed/", "topic": "global", "official": False},
+    {"name": "C14 | Channel 14 Israel (Hebrew)", "url": "https://www.c14.co.il/feed/", "topic": "global", "official": False},
+    # Legacy feed may still work through its redirect; keep a fallback source.
+    {"name": "Now 14 Israel | Legacy Feed", "url": "https://www.now14.co.il/feed/", "topic": "global", "official": False},
     # Search feeds supplement direct feeds but Google indexing is not live.
     {"name": "Trump geopolitical headlines via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('(Trump OR "President Trump") (Iran OR Israel OR war OR ceasefire OR sanctions OR tariffs OR oil OR nuclear OR Hormuz OR Fed) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
     {"name": "Trump finance headlines via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('(Trump OR "White House") (economy OR markets OR dollar OR tariffs OR interest rates OR Federal Reserve OR China OR Russia OR Ukraine) when:1d') + "&hl=en-US&gl=US&ceid=US:en", "topic": "global", "official": False},
-    {"name": "Now 14 security via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('site:now14.co.il (איראן OR ישראל OR טראמפ OR מתקפה OR מלחמה OR טילים OR הפסקת אש) when:1d') + "&hl=he&gl=IL&ceid=IL:he", "topic": "global", "official": False},
+    {"name": "Now 14 security via Google News", "url": "https://news.google.com/rss/search?q=" + quote_plus('(site:c14.co.il OR site:now14.co.il) (נתניהו OR איראן OR ישראל OR טראמפ OR מתקפה OR מלחמה OR טילים OR הפסקת אש) when:1d') + "&hl=he&gl=IL&ceid=IL:he", "topic": "global", "official": False},
     {"name": "Federal Reserve | Monetary Policy", "url": "https://www.federalreserve.gov/feeds/press_monetary.xml", "topic": "fed", "official": True},
     {"name": "Federal Reserve | Speeches", "url": "https://www.federalreserve.gov/feeds/speeches.xml", "topic": "fed_speech", "official": True},
     {"name": "BLS | CPI", "url": "https://www.bls.gov/feed/cpi.rss", "topic": "cpi", "official": True},
@@ -323,11 +326,11 @@ HEBREW_SPECULATIVE_TITLE = re.compile(
     r"(?:אפשרות של|אפשרות ל|אולי|עשוי|ייתכן|יתכן|תיתכן|מה יקרה|"
     r"האם |שמועה|ללא אישור|לא מאומת|חשש ממלחמה|בחשש למלחמה)", re.I)
 HEBREW_MIDEAST_ANCHOR = re.compile(
-    r"(?:איראן|איראני|ישראל|ישראלי|ארה\"ב|ארצות הברית|"
+    r"(?:איראן|איראני|ישראל|ישראלי|נתניהו|בנימין נתניהו|צה\"ל|ארה\"ב|ארצות הברית|"
     r"טראמפ|נתניהו|לבנון|עזה|סוריה|חמאס|חיזבאללה|תימן|"
     r"הורמוז|נפט|דולר|כלכלה|ריבית|סנקציות|רוסיה|אוקראינה)", re.I)
 HEBREW_CONCRETE_EVENT = re.compile(
-    r"(?:תקיפה|תקף|תקפו|הותקף|ירי|שיגור|שיגרו|שוגר|"
+    r"(?:תקיפה|תקף|תקפו|הותקף|ירי|שיגור|שיגרו|שוגר|הצהיר|אישר|הורה|הנחה|נפגש|הודיע|דחה|הסכים|"
     r"טיל|טילים|כטב\"ם|פיצוץ|הפסקת אש|הסכם|סנקציות|"
     r"הודיע|הכריז|אמר|אומר|מאיים|איים|פגישה|"
     r"התקפה|מלחמה|מחיר|מחירי|נפל|עלה|הורדת ריבית|"
@@ -631,6 +634,8 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     # source links or publisher names in Telegram messages.
     db.execute("CREATE TABLE IF NOT EXISTS observations (fingerprint TEXT PRIMARY KEY, title TEXT, source TEXT, published_utc TEXT, first_observed_utc TEXT)")
     db.execute("CREATE TABLE IF NOT EXISTS published_stories (fingerprint TEXT PRIMARY KEY, title TEXT, source TEXT, url TEXT, published_utc TEXT, sent_utc TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS published_localized (fingerprint TEXT PRIMARY KEY, fa_title TEXT NOT NULL, event_key TEXT NOT NULL, sent_utc TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS translated_titles (title_hash TEXT PRIMARY KEY, fa_title TEXT NOT NULL, created_utc TEXT NOT NULL)")
     db.commit()
     return db
 
@@ -881,7 +886,11 @@ def translate_title(title: str) -> str:
         return title
     try:
         language_pair = "he|fa" if re.search(r"[\u0590-\u05ff]", source) else "en|fa"
-        url = "https://api.mymemory.translated.net/get?" + urlencode({"q": source, "langpair": language_pair})
+        params = {"q": source, "langpair": language_pair}
+        email = os.getenv("TRANSLATION_CONTACT_EMAIL", "").strip()
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            params["de"] = email  # Optional higher MyMemory quota, see API terms.
+        url = "https://api.mymemory.translated.net/get?" + urlencode(params)
         payload = json.loads(http_get(url, timeout=5))
         translated = clean_text(payload.get("responseData", {}).get("translatedText", ""))
         translated = compact_headline(translated, 175)
@@ -896,6 +905,210 @@ def translate_title(title: str) -> str:
     except (ValueError, KeyError, TypeError, URLError, OSError, TimeoutError) as exc:
         LOGGER.info("Translation unavailable; original headline retained (%s)", type(exc).__name__)
         return source
+
+
+
+# News display labels should always be Persian. Price-feed attributions are
+# deliberately handled separately by price_board_text, per their license.
+PUBLISHER_LABELS = (
+    ("c14", "شبکه ۱۴ اسرائیل"),
+    ("now 14", "شبکه ۱۴ اسرائیل"),
+    ("channel 14", "شبکه ۱۴ اسرائیل"),
+    ("white house", "کاخ سفید"),
+    ("reuters", "رویترز"),
+    ("associated press", "آسوشیتدپرس"),
+    ("ap news", "آسوشیتدپرس"),
+    ("bbc", "بی‌بی‌سی"),
+    ("cnbc", "سی‌ان‌بی‌سی"),
+    ("times of israel", "تایمز اسرائیل"),
+    ("jerusalem post", "جروزالم پست"),
+    ("jpost", "جروزالم پست"),
+    ("haaretz", "هاآرتص"),
+    ("ynet", "وای‌نت"),
+    ("al jazeera", "الجزیره"),
+    ("coindesk", "کوین‌دسک"),
+    ("npr", "ان‌پی‌آر"),
+    ("the guardian", "گاردین"),
+    ("dw", "دویچه‌وله"),
+    ("federal reserve", "فدرال رزرو آمریکا"),
+    ("bls", "اداره آمار کار آمریکا"),
+    ("ecb", "بانک مرکزی اروپا"),
+    ("eia", "اداره اطلاعات انرژی آمریکا"),
+    ("sec", "کمیسیون بورس آمریکا"),
+    ("centcom", "ستاد فرماندهی مرکزی آمریکا"),
+    ("idf", "ارتش اسرائیل"),
+    ("irna", "ایرنا"),
+    ("isna", "ایسنا"),
+    ("mehr", "مهر"),
+    ("tasnim", "تسنیم"),
+    ("yjc", "باشگاه خبرنگاران جوان"),
+    ("ynet", "وای‌نت"),
+)
+
+
+def publisher_label(a: Article) -> str:
+    """Credit the feed honestly; a Google search feed is not a direct API."""
+    source = a.source.lower()
+    # If indexed via Google News, the trailing publisher suffix often indicates
+    # the article's actual publisher. Prefer known explicit labels.
+    suffix = re.search(r"\s+[-|]\s+([^|]+)$", clean_text(a.title))
+    if suffix and "google news" in source:
+        tail = suffix.group(1).strip().lower()
+        for hint, label in PUBLISHER_LABELS:
+            if tail == hint or tail.startswith(hint + " "):
+                return label + " (بازنشر)"
+    for hint, label in PUBLISHER_LABELS:
+        if hint in source:
+            return label + (" (بازنشر)" if "google news" in source or "via google" in source else "")
+    if "google news" in source:
+        return "گوگل نیوز (بازنشر)"
+    return "منبع خبری"
+
+
+LATIN_HEADLINE_WORDS = re.compile(r"[A-Za-z]{4,}")
+ALLOWED_NEWS_ACRONYMS = {"fomc", "nfp", "cpi", "ppi", "xauusd", "usdt", "dxy", "opec", "etf", "gdp", "ecb", "sec"}
+
+
+def is_publishable_persian(text: str) -> bool:
+    """Block untranslated English/Hebrew and partly translated boilerplate."""
+    if not text or len(re.findall(r"[\u0600-\u06ff]", text)) < 8:
+        return False
+    if re.search(r"[\u0590-\u05ff]", text):
+        return False
+    return not any(w.casefold() not in ALLOWED_NEWS_ACRONYMS for w in LATIN_HEADLINE_WORDS.findall(text))
+
+
+def prepare_persian_headline(a: Article, db: sqlite3.Connection | None = None) -> str | None:
+    """Never publish a non-Persian fallback after a failed translation."""
+    raw = compact_headline(a.title)
+    if is_publishable_persian(raw):
+        return raw
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if db is not None:
+        row = db.execute("SELECT fa_title FROM translated_titles WHERE title_hash=?", (key,)).fetchone()
+        if row and is_publishable_persian(row[0]):
+            return row[0]
+    translated = translate_title(raw)
+    if is_publishable_persian(translated):
+        if db is not None:
+            db.execute("INSERT OR REPLACE INTO translated_titles VALUES (?,?,?)",
+                       (key, translated, datetime.now(timezone.utc).isoformat()))
+            db.commit()
+        return translated
+    LOGGER.warning("No Persian translation available for feed=%s. Skipping this scan.", a.source)
+    return None
+
+
+_PERSIAN_REPLACEMENTS = (
+    (r"\bدونالد\s+ترامپ\b", "ترامپ"),
+    (r"\bبنیامین\s+نتانیاهو\b", "نتانیاهو"),
+    (r"\bایالات\s+متحده(?:\s+آمریکا)?\b", "آمریکا"),
+    (r"\bامریکا\b", "آمریکا"),
+    (r"\bتوافق(?:ی|نامه|نامه‌ای)?\b", "توافق"),
+    (r"\bموافقت\b", "توافق"),
+    (r"\bگفتگوها\b", "مذاکرات"),
+    (r"\bمذاکره(?:‌ها|ها|‌ای|ای)?\b", "مذاکرات"),
+    (r"\bاعلام\s+کرد\b", "گفت"),
+    (r"\bاظهار\s+کرد\b", "گفت"),
+    (r"\bتأکید\s+کرد\b", "گفت"),
+    (r"\bتاکید\s+کرد\b", "گفت"),
+)
+
+
+def normalize_fa_story_title(text: str) -> str:
+    text = unicodedata.normalize("NFKC", compact_headline(text)).casefold()
+    text = text.replace("ي", "ی").replace("ك", "ک").replace("ۀ", "ه")
+    text = text.replace("\u200c", " ").replace("\u200f", " ")
+    text = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+    for pattern, replacement in _PERSIAN_REPLACEMENTS:
+        text = re.sub(pattern, replacement, text, flags=re.I)
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text)).strip()
+
+
+_TRUMP_IRAN = re.compile(r"ترامپ")
+_IRAN = re.compile(r"ایران")
+_DEAL = re.compile(r"توافق")
+_DEAL_REFUSAL = re.compile(
+    r"(?:هیچ\s+توافق|توافق\s+(?:نمی|نخواه|نخواهیم|نخواهد|نشد)|"
+    r"(?:نمی|نخواهیم|نخواهد|نخواهند)\s+[^.،؛]{0,34}توافق|"
+    r"توافق[^.،؛]{0,25}(?:رد|منتفی|نمی|نخواه)|"
+    r"از\s+توافق\s+صرف\s+نظر|عدم\s+توافق|توافقی\s+در\s+کار\s+نیست)"
+)
+_DEAL_UNREACHED = re.compile(r"(?:هنوز|تا\s+کنون|فعلا).{0,30}(?:توافق\s+(?:نشده|حاصل\s+نشده)|به\s+توافق\s+نرسید)")
+
+
+def event_signature(fa_title: str) -> str:
+    """Only highly constrained semantic families; avoid merging updates."""
+    norm = normalize_fa_story_title(fa_title)
+    if (_TRUMP_IRAN.search(norm) and _IRAN.search(norm) and _DEAL.search(norm)
+            and not numeric_tokens(norm)):
+        if _DEAL_UNREACHED.search(norm):
+            return "trump_iran_deal_status_unreached"
+        if _DEAL_REFUSAL.search(norm):
+            return "trump_iran_deal_refusal"
+    return ""
+
+
+_FA_STOP = set("""از به با که در و را برای یک این آن او آنها وی گفت گفته می گوید میگوید اعلام کرد کرده درباره مورد پس پیش تازه جدید آخرین خبر گزارش خبرنگار به نقل بر اساس طبق هم همچنین تا اما آیا چه شد شده است هستند بود بودند خواهد می شود میکند کرده اند دارد اند را روز امروز دیروز امشب""".split())
+_FA_CONTENT_EQUIV = {
+    "نمی": "نفی", "نخواهد": "نفی", "نخواهیم": "نفی", "نخواهند": "نفی",
+    "توافقی": "توافق", "توافقنامه": "توافق", "توافقنامه‌ای": "توافق",
+    "اسرائیلی": "اسرائیل", "ایرانی": "ایران", "آمریکایی": "آمریکا",
+    "بیانیه": "اعلام", "اظهارات": "اعلام", "اظهار": "اعلام",
+    "رد": "رد", "ردکرد": "رد",
+}
+
+
+def story_tokens(text: str) -> set[str]:
+    words = normalize_fa_story_title(text).split()
+    return {_FA_CONTENT_EQUIV.get(w, w) for w in words if w not in _FA_STOP and len(w) > 2}
+
+
+def likely_same_story(left: str, right: str) -> bool:
+    """Cross-source dedup AFTER translating both titles into Persian.
+
+    Protect explicit figures and negation, and require substantial overlap.
+    This is heuristic and cannot be a full semantic fact-checker.
+    """
+    l_key, r_key = event_signature(left), event_signature(right)
+    if l_key and l_key == r_key:
+        return True
+    if l_key or r_key:
+        return False
+    a, b = normalize_fa_story_title(left), normalize_fa_story_title(right)
+    if numeric_tokens(a) != numeric_tokens(b):
+        return False
+    ta, tb = story_tokens(a), story_tokens(b)
+    if not ta or not tb:
+        return a == b
+    # Strong negation disagreement should never be collapsed.
+    nega = bool(re.search(r"\b(?:نمی|نخواه|نفی|رد|تکذیب|عدم|منتفی|بدون)\w*\b", a))
+    negb = bool(re.search(r"\b(?:نمی|نخواه|نفی|رد|تکذیب|عدم|منتفی|بدون)\w*\b", b))
+    if nega != negb:
+        return False
+    overlap = len(ta & tb)
+    containment = overlap / max(1, min(len(ta), len(tb)))
+    dice = 2 * overlap / (len(ta) + len(tb))
+    return (overlap >= 4 and containment >= 0.86 and dice >= 0.78)
+
+
+def localized_duplicate(db: sqlite3.Connection, fa_title: str, *, lookback_h: int = 24) -> bool:
+    since = (datetime.now(timezone.utc) - timedelta(hours=lookback_h)).isoformat()
+    rows = db.execute(
+        "SELECT fa_title, event_key FROM published_localized WHERE sent_utc >= ? ORDER BY sent_utc DESC LIMIT 500",
+        (since,),
+    ).fetchall()
+    sig = event_signature(fa_title)
+    return any((sig and key and sig == key) or likely_same_story(fa_title, existing)
+               for existing, key in rows)
+
+
+def mark_localized_sent(db: sqlite3.Connection, fingerprint_key: str, fa_title: str) -> None:
+    db.execute("INSERT OR REPLACE INTO published_localized VALUES (?,?,?,?)",
+               (fingerprint_key, fa_title, event_signature(fa_title), datetime.now(timezone.utc).isoformat()))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    db.execute("DELETE FROM published_localized WHERE sent_utc < ?", (cutoff,))
+    db.commit()
 
 
 # Importance is not the same as confidence. Do not label every selected
@@ -948,23 +1161,23 @@ def importance_marker(a: Article, rating: Assessment) -> str:
     return "⚪"
 
 
-def format_alert(a: Article, rating: Assessment, channel: str = "", *, translate: bool = False) -> str:
-    """Compact headline with severity marker and only the user's channel URL.
-
-    Ordinary articles intentionally omit timestamps and publisher names.
-    Only dedicated economic calendar alerts have Tehran dates/times.
-    """
-    headline = compact_headline(a.title)
-    if translate:
-        headline = translate_title(headline)
+def format_alert(a: Article, rating: Assessment, channel: str = "", *, translate: bool = False,
+                 headline_fa: str | None = None) -> str:
+    """Compact Persian news, publisher credit and user's own channel link."""
+    headline = headline_fa or compact_headline(a.title)
+    if translate and not headline_fa:
+        headline = prepare_persian_headline(a) or ""
+    if not headline:
+        return ""
     marker = importance_marker(a, rating)
     if marker.startswith("🔴"):
         body = marker + "\n\n" + headline
     else:
         body = marker + " " + headline
+    body += "\n\n📰 منبع: " + publisher_label(a)
     footer = channel_link(channel)
     if footer:
-        body += "\n\n🔗 " + footer
+        body += "\n🔗 " + footer
     return body
 
 
@@ -1182,7 +1395,10 @@ def initial_digest(db: sqlite3.Connection, articles: list[Article], token: str,
     for key, a, assessment in shortlist[:3]:
         # A one-off digest needs a clear 'recent' label so older headlines are
         # never mistaken for breaking reports. This never repeats every cycle.
-        message = "🗞 مرور خبرهای اخیر\n\n" + format_alert(a, assessment, channel, translate=True)
+        fa_title = prepare_persian_headline(a, db)
+        if not fa_title or localized_duplicate(db, fa_title):
+            continue
+        message = "🗞 مرور خبرهای اخیر\n\n" + format_alert(a, assessment, channel, headline_fa=fa_title)
         try:
             telegram_send(message, token, channel)
         except (RuntimeError, TimeoutError, URLError, OSError) as exc:
@@ -1193,6 +1409,7 @@ def initial_digest(db: sqlite3.Connection, articles: list[Article], token: str,
             (key, now.isoformat()),
         )
         db.commit()
+        mark_localized_sent(db, key, fa_title)
         sent += 1
         time.sleep(1)
 
@@ -1275,7 +1492,7 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
     LOGGER.info("Editorial filter reasons: %s", json.dumps(quality_rejections, ensure_ascii=False, sort_keys=True))
     LOGGER.info("Priority source headlines received: %s", json.dumps({
         name: sum(1 for a in distinct.values() if a.source == name)
-        for name in ("White House | News", "White House | Briefings and Statements", "Now 14 Israel | News (Hebrew)",
+        for name in ("White House | News", "White House | Briefings and Statements", "C14 | Channel 14 Israel (Hebrew)", "Now 14 Israel | Legacy Feed",
                      "Trump geopolitical headlines via Google News", "Trump finance headlines via Google News", "Now 14 security via Google News")
     }, ensure_ascii=False))
     candidates.sort(key=lambda r: (
@@ -1294,13 +1511,28 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
     if daily_limit:
         allowance = min(allowance, max(0, daily_limit - already_today))
     sent = 0
+    skipped_translation = 0
+    story_duplicates = 0
+    scan_titles: list[str] = []
     cycle_budget = max(60, int(os.getenv("MAX_CYCLE_SECONDS", "420")))
     send_start = monotonic()
     for key, a, rating in candidates[:allowance]:
         if monotonic() - send_start >= cycle_budget:
-            LOGGER.info("Runtime budget reached; %d pending headline(s) stay eligible for the next scan", allowance - sent)
+            LOGGER.info("Runtime budget reached; pending headlines stay eligible for the next scan")
             break
-        alert = format_alert(a, rating, channel, translate=not preview)
+        if preview:
+            fa_title = compact_headline(a.title)
+        else:
+            fa_title = prepare_persian_headline(a, db)
+            if not fa_title:
+                skipped_translation += 1
+                # Do not mark seen. Try again in a later scan before expiration.
+                continue
+            if any(likely_same_story(fa_title, old_title) for old_title in scan_titles) or localized_duplicate(db, fa_title):
+                story_duplicates += 1
+                mark_seen(db, key, "duplicate")
+                continue
+        alert = format_alert(a, rating, channel, headline_fa=fa_title)
         if preview:
             print("\n" + "=" * 45 + "\n" + alert + "\n")
         else:
@@ -1310,10 +1542,12 @@ def cycle(db: sqlite3.Connection, token: str, channel: str, *, preview: bool, ma
                 LOGGER.error("Telegram send failed. Will retry later: %s", exc)
                 break
             mark_sent(db, key, a)
+            mark_localized_sent(db, key, fa_title)
+            scan_titles.append(fa_title)
             sent += 1
             put_meta(db, day_key, str(already_today + sent))
-            # Telegram advises not exceeding ~1 message/s in one chat.
             time.sleep(1.2)
+    LOGGER.info("Editorial delivery: %d sent; %d cross-source duplicates; %d translation unavailable", sent, story_duplicates, skipped_translation)
     LOGGER.info("Publishing: %d sent this scan, %d selected, daily limit=%s, per-cycle limit=%s", sent, len(candidates), daily_limit or "none", max_per_cycle or "none")
     if not preview and sent == 0 and not candidates and allowance > 0:
         # One-time startup digest, if no real alerts have ever reached Telegram.
